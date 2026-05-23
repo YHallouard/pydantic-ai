@@ -17,8 +17,10 @@ from pydantic_ai.tools import (
     AgentNativeTool,
     DeferredToolRequests,
     DeferredToolResults,
+    RawToolArgs,
     RunContext,
     ToolDefinition,
+    ValidatedToolArgs,
 )
 from pydantic_ai.toolsets import AbstractToolset, AgentToolset
 
@@ -49,12 +51,6 @@ WrapNodeRunHandler: TypeAlias = 'Callable[[_agent_graph.AgentNode[AgentDepsT, An
 
 WrapModelRequestHandler: TypeAlias = 'Callable[[ModelRequestContext], Awaitable[ModelResponse]]'
 """Handler type for [`wrap_model_request`][pydantic_ai.capabilities.AbstractCapability.wrap_model_request]."""
-
-RawToolArgs: TypeAlias = str | dict[str, Any]
-"""Type alias for raw (pre-validation) tool arguments."""
-
-ValidatedToolArgs: TypeAlias = dict[str, Any]
-"""Type alias for validated tool arguments."""
 
 WrapToolValidateHandler: TypeAlias = Callable[[RawToolArgs], Awaitable[ValidatedToolArgs]]
 """Handler type for [`wrap_tool_validate`][pydantic_ai.capabilities.AbstractCapability.wrap_tool_validate]."""

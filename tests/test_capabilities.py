@@ -18189,6 +18189,178 @@ async def test_deferred_tool_handler_via_hooks_returns_none_when_unhandled():
     assert len(result.output.approvals) == 1
 
 
+async def test_requires_approval_callable_sync_returns_metadata():
+    """`requires_approval=callable` (sync) raises `ApprovalRequired` with metadata when callable returns a dict."""
+    from pydantic_ai.tools import RequiresApprovalFunc
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart('my_tool', {'x': 5}, tool_call_id='call1')])
+        return ModelResponse(parts=[TextPart('Done!')])
+
+    async def handle_deferred(ctx: RunContext[None], requests: DeferredToolRequests) -> DeferredToolResults:
+        return DeferredToolResults(approvals={call.tool_call_id: True for call in requests.approvals})
+
+    def needs_approval(ctx: RunContext[None], args: dict[str, Any]) -> dict[str, Any] | None:
+        return {'reason': 'dangerous operation', 'arg_x': args['x']}
+
+    requires_approval_func: RequiresApprovalFunc[None] = needs_approval
+
+    agent = Agent(
+        FunctionModel(llm),
+        capabilities=[HandleDeferredToolCalls(handler=handle_deferred)],
+    )
+
+    @agent.tool(requires_approval=requires_approval_func)
+    def my_tool(ctx: RunContext[None], x: int) -> int:
+        return x * 10
+
+    result = await agent.run('Hello')
+    assert result.output == 'Done!'
+    tool_returns = [
+        p
+        for m in result.all_messages()
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, ToolReturnPart)
+    ]
+    assert len(tool_returns) == 1
+    assert tool_returns[0].content == 50
+
+
+async def test_requires_approval_callable_async_returns_metadata():
+    """`requires_approval=callable` (async) raises `ApprovalRequired` with metadata when awaitable returns a dict."""
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart('my_tool', {'x': 3}, tool_call_id='call1')])
+        return ModelResponse(parts=[TextPart('Done!')])
+
+    async def handle_deferred(ctx: RunContext[None], requests: DeferredToolRequests) -> DeferredToolResults:
+        return DeferredToolResults(approvals={call.tool_call_id: True for call in requests.approvals})
+
+    async def needs_approval(ctx: RunContext[None], args: dict[str, Any]) -> dict[str, Any] | None:
+        return {'async': True}
+
+    agent = Agent(
+        FunctionModel(llm),
+        capabilities=[HandleDeferredToolCalls(handler=handle_deferred)],
+    )
+
+    @agent.tool(requires_approval=needs_approval)
+    def my_tool(ctx: RunContext[None], x: int) -> int:
+        return x * 10
+
+    result = await agent.run('Hello')
+    assert result.output == 'Done!'
+    tool_returns = [
+        p
+        for m in result.all_messages()
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, ToolReturnPart)
+    ]
+    assert len(tool_returns) == 1
+    assert tool_returns[0].content == 30
+
+
+async def test_requires_approval_callable_returns_none_runs_directly():
+    """`requires_approval=callable` returning `None` lets the tool execute without approval."""
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart('safe_tool', {'x': 7}, tool_call_id='call1')])
+        return ModelResponse(parts=[TextPart('Done!')])
+
+    def maybe_approval(ctx: RunContext[None], args: dict[str, Any]) -> dict[str, Any] | None:
+        # Only require approval for large values
+        if args.get('x', 0) > 100:
+            return {'reason': 'large value'}  # pragma: no cover
+        return None  # x=7 is safe — no approval needed
+
+    agent = Agent(FunctionModel(llm))
+
+    @agent.tool(requires_approval=maybe_approval)
+    def safe_tool(ctx: RunContext[None], x: int) -> int:
+        return x * 2
+
+    result = await agent.run('Hello')
+    assert result.output == 'Done!'
+    tool_returns = [
+        p
+        for m in result.all_messages()
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, ToolReturnPart)
+    ]
+    assert len(tool_returns) == 1
+    # Tool ran directly, returned 7 * 2 = 14
+    assert tool_returns[0].content == 14
+
+
+async def test_requires_approval_callable_tool_def_kind_is_function():
+    """A tool with callable `requires_approval` has `ToolDefinition.kind == 'function'` so call_tool() runs on first pass."""
+    from pydantic_ai.toolsets import FunctionToolset
+
+    def my_approval(ctx: RunContext[None], args: dict[str, Any]) -> dict[str, Any] | None:
+        return {'reason': 'always approve'}
+
+    ts: FunctionToolset[None] = FunctionToolset()
+
+    @ts.tool(requires_approval=my_approval)
+    def my_tool(ctx: RunContext[None]) -> str:
+        return 'done'  # pragma: no cover
+
+    captured_tool_defs: list[ToolDefinition] = []
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        captured_tool_defs.extend(info.function_tools)
+        return ModelResponse(parts=[TextPart('ok')])
+
+    agent = Agent(FunctionModel(model_fn), toolsets=[ts])
+    await agent.run('hello')
+
+    assert len(captured_tool_defs) == 1
+    assert captured_tool_defs[0].name == 'my_tool'
+    # Callable requires_approval uses kind='function' so call_tool() is invoked on first pass;
+    # ApprovalRequired is raised dynamically based on the callable's return value.
+    assert captured_tool_defs[0].kind == 'function'
+
+
+async def test_requires_approval_callable_metadata_passed_to_deferred_request():
+    """Metadata dict returned by callable is available in `DeferredToolRequests.approvals[*].metadata`."""
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart('risky', {'amount': 42}, tool_call_id='call1')])
+        return ModelResponse(parts=[TextPart('done')])
+
+    captured_metadata: list[dict[str, Any]] = []
+
+    async def handle_deferred(ctx: RunContext[None], requests: DeferredToolRequests) -> DeferredToolResults:
+        for call in requests.approvals:
+            meta = requests.metadata.get(call.tool_call_id)
+            if meta is not None:
+                captured_metadata.append(meta)
+        return DeferredToolResults(approvals={call.tool_call_id: True for call in requests.approvals})
+
+    def approval_with_metadata(ctx: RunContext[None], args: dict[str, Any]) -> dict[str, Any] | None:
+        return {'amount': args['amount'], 'reason': 'large transfer'}
+
+    agent = Agent(
+        FunctionModel(llm),
+        capabilities=[HandleDeferredToolCalls(handler=handle_deferred)],
+    )
+
+    @agent.tool(requires_approval=approval_with_metadata)
+    def risky(ctx: RunContext[None], amount: int) -> str:
+        return f'transferred {amount}'
+
+    result = await agent.run('transfer')
+    assert result.output == 'done'
+    assert captured_metadata == [{'amount': 42, 'reason': 'large transfer'}]
+
+
 # --- Dynamic capabilities ---
 
 

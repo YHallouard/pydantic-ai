@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
@@ -10,12 +11,13 @@ from pydantic.json_schema import GenerateJsonSchema
 
 from .._run_context import AgentDepsT, RunContext
 from .._system_prompt import SystemPromptRunner
-from ..exceptions import ModelRetry, UserError
+from ..exceptions import ApprovalRequired, ModelRetry, UserError
 from ..messages import InstructionPart
 from ..tools import (
     ArgsValidatorFunc,
     DocstringFormat,
     GenerateToolJsonSchema,
+    RequiresApprovalFunc,
     SystemPromptFunc,
     Tool,
     ToolFuncContext,
@@ -68,7 +70,7 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
         schema_generator: type[GenerateJsonSchema] = GenerateToolJsonSchema,
         strict: bool | None = None,
         sequential: bool = False,
-        requires_approval: bool = False,
+        requires_approval: bool | RequiresApprovalFunc[AgentDepsT] = False,
         metadata: dict[str, Any] | None = None,
         defer_loading: bool = False,
         include_return_schema: bool | None = None,
@@ -165,7 +167,7 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
         schema_generator: type[GenerateJsonSchema] | None = None,
         strict: bool | None = None,
         sequential: bool | None = None,
-        requires_approval: bool | None = None,
+        requires_approval: bool | RequiresApprovalFunc[AgentDepsT] | None = None,
         metadata: dict[str, Any] | None = None,
         timeout: float | None = None,
         defer_loading: bool | None = None,
@@ -187,7 +189,7 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
         schema_generator: type[GenerateJsonSchema] | None = None,
         strict: bool | None = None,
         sequential: bool | None = None,
-        requires_approval: bool | None = None,
+        requires_approval: bool | RequiresApprovalFunc[AgentDepsT] | None = None,
         metadata: dict[str, Any] | None = None,
         timeout: float | None = None,
         defer_loading: bool | None = None,
@@ -320,7 +322,7 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
         schema_generator: type[GenerateJsonSchema] | None = None,
         strict: bool | None = None,
         sequential: bool | None = None,
-        requires_approval: bool | None = None,
+        requires_approval: bool | RequiresApprovalFunc[AgentDepsT] | None = None,
         metadata: dict[str, Any] | None = None,
         timeout: float | None = None,
         defer_loading: bool | None = None,
@@ -342,7 +344,7 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
         schema_generator: type[GenerateJsonSchema] | None = None,
         strict: bool | None = None,
         sequential: bool | None = None,
-        requires_approval: bool | None = None,
+        requires_approval: bool | RequiresApprovalFunc[AgentDepsT] | None = None,
         metadata: dict[str, Any] | None = None,
         timeout: float | None = None,
         defer_loading: bool | None = None,
@@ -491,7 +493,7 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
         schema_generator: type[GenerateJsonSchema] | None = None,
         strict: bool | None = None,
         sequential: bool | None = None,
-        requires_approval: bool | None = None,
+        requires_approval: bool | RequiresApprovalFunc[AgentDepsT] | None = None,
         defer_loading: bool | None = None,
         metadata: dict[str, Any] | None = None,
         timeout: float | None = None,
@@ -634,13 +636,35 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
                 else:
                     raise UserError(f'Tool name conflicts with previously renamed tool: {new_name!r}.')
 
+            call_func: Callable[[dict[str, Any], RunContext[AgentDepsT]], Awaitable[Any]] = tool.function_schema.call
+            if callable(tool.requires_approval):
+                approval_fn = tool.requires_approval
+                _inner = call_func
+
+                async def _guarded(
+                    args: dict[str, Any],
+                    ctx: RunContext[AgentDepsT],
+                    *,
+                    _check: RequiresApprovalFunc[AgentDepsT] = approval_fn,
+                    _orig: Callable[[dict[str, Any], RunContext[AgentDepsT]], Awaitable[Any]] = _inner,
+                ) -> Any:
+                    if not ctx.tool_call_approved:
+                        result = _check(ctx, args)
+                        if inspect.isawaitable(result):
+                            result = await result
+                        if result is not None:
+                            raise ApprovalRequired(metadata=result)
+                    return await _orig(args, ctx)
+
+                call_func = _guarded
+
             tools[new_name] = FunctionToolsetTool(
                 toolset=self,
                 tool_def=tool_def,
                 max_retries=max_retries,
                 args_validator=tool.function_schema.validator,
                 args_validator_func=tool.args_validator,
-                call_func=tool.function_schema.call,
+                call_func=call_func,
                 is_async=tool.function_schema.is_async,
                 timeout=tool_def.timeout,
             )
