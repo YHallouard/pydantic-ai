@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
@@ -8,6 +7,8 @@ from typing import Any, overload
 
 import anyio
 from pydantic.json_schema import GenerateJsonSchema
+
+from pydantic_ai._utils import is_async_callable, run_in_executor
 
 from .._run_context import AgentDepsT, RunContext
 from .._system_prompt import SystemPromptRunner
@@ -649,9 +650,11 @@ class FunctionToolset(AbstractToolset[AgentDepsT]):
                     _orig: Callable[[dict[str, Any], RunContext[AgentDepsT]], Awaitable[Any]] = _inner,
                 ) -> Any:
                     if not ctx.tool_call_approved:
-                        result = _check(ctx, args)
-                        if inspect.isawaitable(result):
-                            result = await result
+                        result: dict[str, Any] | None
+                        if is_async_callable(_check):
+                            result = await _check(ctx, args)
+                        else:
+                            result = await run_in_executor(_check, ctx, args)
                         if result is not None:
                             raise ApprovalRequired(metadata=result)
                     return await _orig(args, ctx)

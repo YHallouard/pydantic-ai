@@ -182,10 +182,15 @@ RawToolArgs: TypeAlias = str | dict[str, Any]
 ValidatedToolArgs: TypeAlias = dict[str, Any]
 """Type alias for validated tool arguments."""
 
-RequiresApprovalFunc: TypeAlias = Callable[
+_RequiresApprovalFuncSync: TypeAlias = Callable[
     [RunContext[AgentDepsT], ValidatedToolArgs],
-    'dict[str, Any] | None | Awaitable[dict[str, Any] | None]',
+    dict[str, Any] | None,
 ]
+_RequiresApprovalFuncAsync: TypeAlias = Callable[
+    [RunContext[AgentDepsT], ValidatedToolArgs],
+    Awaitable[dict[str, Any] | None],
+]
+RequiresApprovalFunc: TypeAlias = _RequiresApprovalFuncSync[AgentDepsT] | _RequiresApprovalFuncAsync[AgentDepsT]
 """A callable that decides whether a tool call requires approval and constructs the approval metadata.
 
 Receives the run context and validated tool arguments. If it returns a `dict`, approval is required
