@@ -26,7 +26,7 @@ from ._agent import TemporalAgent  # pyright: ignore[reportDeprecated]
 from ._durability import TemporalDurability
 from ._logfire import LogfirePlugin
 from ._run_context import TemporalRunContext
-from ._toolset import TemporalWrapperToolset
+from ._toolset import DurableEnvironmentLease, TemporalWrapperToolset
 from ._workflow import PydanticAIWorkflow
 
 __all__ = [
@@ -38,6 +38,7 @@ __all__ = [
     'TemporalRunContext',
     'TemporalWrapperToolset',
     'PydanticAIWorkflow',
+    'DurableEnvironmentLease',
 ]
 
 # We need eagerly import the anyio backends or it will happens inside workflow code and temporal has issues

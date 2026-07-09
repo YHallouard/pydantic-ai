@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from pydantic import ConfigDict, Discriminator, Tag, with_config
 from temporalio import workflow
 from temporalio.workflow import ActivityConfig
-from typing_extensions import Self, assert_never
+from typing_extensions import Self, TypedDict, assert_never
 
 from pydantic_ai import AbstractToolset, FunctionToolset, ToolsetTool, WrapperToolset
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
@@ -168,6 +168,24 @@ class TemporalWrapperToolset(WrapperToolset[AgentDepsT], ABC):
         return await self._wrap_call_tool_result(toolset.call_tool(name, args_dict, ctx, tool))
 
 
+class DurableEnvironmentLease(TypedDict):
+    """Shape of `RunContext.metadata['durable_env']`, the lease routing env-bound tool activities.
+
+    Set by whatever manages the stateful resource (a filesystem workspace, a shell, a code
+    sandbox) -- typically pydantic-ai-harness's `DurableEnvironment` capability, which owns the
+    lease lifecycle (acquire/fence/release). Core only reads `env_queue` from it, to route an
+    env-bound tool's activity to the worker holding the resource.
+
+    The transport is a plain dict (`RunContext.metadata` round-trips through JSON via
+    `TemporalRunContext`); this `TypedDict` is the documented contract for its shape, mirroring
+    how `ActivityConfig` types the per-tool config dict.
+    """
+
+    env_id: str
+    env_queue: str
+    epoch: int
+
+
 def resolve_tool_activity_config(
     tool: ToolsetTool[Any] | None,
     tool_name: str,
@@ -187,8 +205,9 @@ def resolve_tool_activity_config(
     workspace, a shell, a code sandbox -- whose activities must land on the worker that holds
     it, not any worker on the shared queue). An `env_bound` tool with no lease in `ctx.metadata`
     behaves exactly as if it weren't tagged: this is the valid "no environment lease manager"
-    mode, not an error. The `durable_env` key and its `env_queue` field are a public contract
-    with whatever assigns the lease (e.g. pydantic-ai-harness's `DurableEnvironment` capability).
+    mode, not an error. The lease shape is the public
+    [`DurableEnvironmentLease`][pydantic_ai.durable_exec.temporal.DurableEnvironmentLease] contract
+    with whatever assigns it (e.g. pydantic-ai-harness's `DurableEnvironment` capability).
     """
     metadata = tool.tool_def.metadata if tool is not None else None
 
@@ -211,9 +230,11 @@ def resolve_tool_activity_config(
     if config is not False and metadata and metadata.get('env_bound'):
         run_metadata: dict[str, Any] | None = ctx.metadata if ctx is not None else None
         lease = run_metadata.get('durable_env') if run_metadata is not None else None
+        # `metadata` is an untyped dict by core contract, so validate the shape at runtime
+        # rather than trusting it matches `DurableEnvironmentLease`. Only `env_queue` is read.
         if isinstance(lease, dict):
-            lease_dict = cast('dict[str, Any]', lease)
-            env_queue = lease_dict.get('env_queue')
+            lease = cast('DurableEnvironmentLease', lease)
+            env_queue = lease.get('env_queue')
             if isinstance(env_queue, str):
                 config = cast('ActivityConfig', {**config, 'task_queue': env_queue})
 
