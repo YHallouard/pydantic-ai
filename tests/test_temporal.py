@@ -119,6 +119,7 @@ try:
 
     from pydantic_ai.durable_exec.temporal import (
         AgentPlugin,
+        DurableEnvironmentLease,
         LogfirePlugin,
         PydanticAIPlugin,
         PydanticAIWorkflow,
@@ -6072,14 +6073,17 @@ def test_resolve_tool_activity_config_routes_env_bound_tool_to_leased_queue():
         args_validator=None,  # pyright: ignore[reportArgumentType]
     )
 
-    ctx_with_lease = RunContext(
-        deps=None,
-        model=TestModel(),
-        usage=RunUsage(),
-        metadata={'durable_env': {'env_queue': 'env-abc123'}},
-    )
+    lease = DurableEnvironmentLease(env_id='env-1', env_queue='env-abc123', epoch=0)
+    ctx_with_lease = RunContext(deps=None, model=TestModel(), usage=RunUsage(), metadata={'durable_env': lease})
     resolved = resolve_tool_activity_config(tool, 'env_tool', {}, ctx_with_lease)
     assert resolved == {'task_queue': 'env-abc123'}
+
+    # Only `env_queue` is read at runtime, so a malformed/partial lease dict that still carries it
+    # routes fine -- the code validates the shape defensively rather than trusting the TypedDict.
+    ctx_partial = RunContext(
+        deps=None, model=TestModel(), usage=RunUsage(), metadata={'durable_env': {'env_queue': 'env-abc123'}}
+    )
+    assert resolve_tool_activity_config(tool, 'env_tool', {}, ctx_partial) == {'task_queue': 'env-abc123'}
 
     # No lease in ctx.metadata: behaves exactly as if the tool weren't tagged env_bound --
     # this is the valid "no DurableEnvironment" mode, not an error.
@@ -8147,7 +8151,8 @@ class EnvBoundRoutingWorkflow:
     async def run(self, prompt: str) -> dict[str, str]:
         # Stands in for the lease a `DurableEnvironment`-style capability would set;
         # this test only exercises the core routing seam, not lease acquisition.
-        result = await _env_routing_agent.run(prompt, metadata={'durable_env': {'env_queue': ENV_TASK_QUEUE}})
+        lease = DurableEnvironmentLease(env_id='env-1', env_queue=ENV_TASK_QUEUE, epoch=0)
+        result = await _env_routing_agent.run(prompt, metadata={'durable_env': lease})
         return {
             part.tool_name: part.content
             for message in result.all_messages()
