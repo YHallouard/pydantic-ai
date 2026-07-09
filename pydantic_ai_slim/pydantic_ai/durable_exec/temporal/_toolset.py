@@ -172,28 +172,52 @@ def resolve_tool_activity_config(
     tool: ToolsetTool[Any] | None,
     tool_name: str,
     tool_activity_config: Mapping[str, ActivityConfig | Literal[False]],
+    ctx: RunContext[Any] | None = None,
 ) -> ActivityConfig | Literal[False]:
     """Resolve per-tool Temporal activity config.
 
     Reads `tool.tool_def.metadata['temporal']` first, then falls back to the explicit
     `tool_activity_config` dict keyed by tool name. Returns an `ActivityConfig` dict
     (possibly empty), or `False` to skip activity wrapping.
+
+    If the tool is tagged `env_bound` (`tool.tool_def.metadata['env_bound'] = True`) and
+    `ctx.metadata['durable_env']` holds a lease dict with an `env_queue` key, that queue is
+    injected as `task_queue`, overriding any queue from the steps above. This is the routing
+    seam for worker-specific task queues (a stateful, machine-local resource -- a filesystem
+    workspace, a shell, a code sandbox -- whose activities must land on the worker that holds
+    it, not any worker on the shared queue). An `env_bound` tool with no lease in `ctx.metadata`
+    behaves exactly as if it weren't tagged: this is the valid "no environment lease manager"
+    mode, not an error. The `durable_env` key and its `env_queue` field are a public contract
+    with whatever assigns the lease (e.g. pydantic-ai-harness's `DurableEnvironment` capability).
     """
+    metadata = tool.tool_def.metadata if tool is not None else None
+
     # Metadata set on the tool (via @toolset.tool(metadata={'temporal': ...}), with_metadata, or
     # SetToolMetadata capability) is the primary path.
-    if tool is not None and tool.tool_def.metadata is not None:
-        metadata_config = tool.tool_def.metadata.get('temporal')
-        if metadata_config is False:
-            return False
-        if metadata_config is not None:
-            if not isinstance(metadata_config, dict):
-                raise UserError(
-                    f"Tool {tool_name!r} has invalid 'temporal' metadata: expected a dict "
-                    f'(`ActivityConfig`) or `False`, got {type(metadata_config).__name__}.'
-                )
-            return cast('ActivityConfig', metadata_config)
-    # Fallback: per-tool dict passed to the durability capability / temporal agent.
-    return tool_activity_config.get(tool_name, {})
+    metadata_config = metadata.get('temporal') if metadata is not None else None
+    if metadata_config is False:
+        return False
+    if metadata_config is not None:
+        if not isinstance(metadata_config, dict):
+            raise UserError(
+                f"Tool {tool_name!r} has invalid 'temporal' metadata: expected a dict "
+                f'(`ActivityConfig`) or `False`, got {type(metadata_config).__name__}.'
+            )
+        config = cast('ActivityConfig', metadata_config)
+    else:
+        # Fallback: per-tool dict passed to the durability capability / temporal agent.
+        config = tool_activity_config.get(tool_name, {})
+
+    if config is not False and metadata and metadata.get('env_bound'):
+        run_metadata: dict[str, Any] | None = ctx.metadata if ctx is not None else None
+        lease = run_metadata.get('durable_env') if run_metadata is not None else None
+        if isinstance(lease, dict):
+            lease_dict = cast('dict[str, Any]', lease)
+            env_queue = lease_dict.get('env_queue')
+            if isinstance(env_queue, str):
+                config = cast('ActivityConfig', {**config, 'task_queue': env_queue})
+
+    return config
 
 
 def temporalize_toolset(

@@ -339,6 +339,45 @@ agent = Agent(
 !!! tip "Configuring third-party tools"
     [`SetToolMetadata`][pydantic_ai.capabilities.SetToolMetadata] is the recommended path when the activity config doesn't belong on the tool definition — for example, tools defined in third-party packages, or a group of tools that share the same timeout profile but live in different files.
 
+### Dynamic task queue routing
+
+A stateful, machine-local tool — a filesystem workspace, a shell, a code sandbox — breaks if its activities land on any worker in the task queue, since consecutive operations need the same worker. The standard Temporal answer is a [worker-specific task queue](https://docs.temporal.io/develop/python/core-application#worker-specific-task-queues): a worker also polls a process-unique queue, and whatever acquires the resource returns that queue's name for callers to route to.
+
+Tag a tool `'env_bound': True` and set `ctx.metadata['durable_env']` to a dict with an `env_queue` key, and [`TemporalDurability`][pydantic_ai.durable_exec.temporal.TemporalDurability]'s tool-activity resolution injects that queue as `task_queue`, overriding any queue from the steps above:
+
+```python {title="temporal_env_bound_routing.py" test="skip"}
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.durable_exec.temporal import TemporalDurability
+from pydantic_ai.toolsets import FunctionToolset
+
+toolset = FunctionToolset(id='workspace')
+
+
+@toolset.tool(metadata={'env_bound': True})  # (1)!
+async def read_file(ctx: RunContext[None], path: str) -> str:
+    ...
+
+
+agent = Agent(
+    'openai:gpt-5.2',
+    name='coder',
+    toolsets=[toolset],
+    capabilities=[TemporalDurability()],
+)
+
+
+async def main():
+    # A real setup acquires the lease from whatever manages the resource (e.g.
+    # an activity backed by a worker-specific queue) before the run, or from a
+    # capability hook that sets it per tool call.
+    await agent.run('Read main.py', metadata={'durable_env': {'env_queue': 'env-worker-1'}})  # (2)!
+```
+
+1. Only the tag is required here — the routing itself happens in `resolve_tool_activity_config`, not in the tool.
+2. `ctx.metadata` is the propagation channel across capability hooks and is serialized into every activity by [`TemporalRunContext`][pydantic_ai.durable_exec.temporal.TemporalRunContext], so the lease travels with no additional plumbing.
+
+A tool tagged `env_bound` with no lease in `ctx.metadata` behaves exactly as if it weren't tagged — this is the valid "no environment lease manager" mode, not an error, so the tag is safe to leave on a tool even when nothing is managing leases yet. The `durable_env` key and its `env_queue` field are a public contract for whatever assigns the lease; [pydantic-ai-harness](https://github.com/pydantic/pydantic-ai-harness)'s environment capabilities are the reference implementation.
+
 ## Activity Retries
 
 On top of the automatic retries for request failures that Temporal will perform, Pydantic AI and various provider API clients also have their own request retry logic. Enabling these at the same time may cause the request to be retried more often than expected, with improper `Retry-After` handling.

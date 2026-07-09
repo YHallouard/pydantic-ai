@@ -179,7 +179,7 @@ class TemporalDynamicToolset(TemporalWrapperToolset[AgentDepsT]):
         if not workflow.in_workflow():  # pragma: no cover
             return await super().call_tool(name, tool_args, ctx, tool)
 
-        tool_activity_config = resolve_tool_activity_config(tool, name, self.tool_activity_config)
+        tool_activity_config = resolve_tool_activity_config(tool, name, self.tool_activity_config, ctx)
         if tool_activity_config is False:  # pragma: no cover
             return await super().call_tool(name, tool_args, ctx, tool)
 

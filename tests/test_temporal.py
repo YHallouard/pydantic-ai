@@ -5557,6 +5557,62 @@ def test_resolve_tool_activity_config_reads_metadata():
         resolve_tool_activity_config(tool, 'fn_tool', {})
 
 
+def test_resolve_tool_activity_config_routes_env_bound_tool_to_leased_queue():
+    """An env_bound tool with a lease in ctx.metadata['durable_env'] is routed to the leased queue."""
+    from pydantic_ai.tools import ToolDefinition
+    from pydantic_ai.toolsets import ToolsetTool
+    from pydantic_ai_slim.pydantic_ai.durable_exec.temporal._toolset import resolve_tool_activity_config
+
+    fn_toolset = FunctionToolset[None](id='env_bound_toolset')
+
+    async def env_tool() -> str:
+        return 'ok'  # pragma: no cover - registered with toolset; test only resolves metadata
+
+    fn_toolset.add_function(env_tool, metadata={'env_bound': True})
+    tool_def = ToolDefinition(name='env_tool', metadata={'env_bound': True})
+    tool = ToolsetTool[None](
+        toolset=fn_toolset,
+        tool_def=tool_def,
+        max_retries=0,
+        args_validator=None,  # pyright: ignore[reportArgumentType]
+    )
+
+    ctx_with_lease = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        metadata={'durable_env': {'env_queue': 'env-abc123'}},
+    )
+    resolved = resolve_tool_activity_config(tool, 'env_tool', {}, ctx_with_lease)
+    assert resolved == {'task_queue': 'env-abc123'}
+
+    # No lease in ctx.metadata: behaves exactly as if the tool weren't tagged env_bound --
+    # this is the valid "no DurableEnvironment" mode, not an error.
+    ctx_no_lease = RunContext(deps=None, model=TestModel(), usage=RunUsage())
+    assert resolve_tool_activity_config(tool, 'env_tool', {}, ctx_no_lease) == {}
+
+    # No ctx at all (the default): same as no lease.
+    assert resolve_tool_activity_config(tool, 'env_tool', {}) == {}
+
+    # A tool not tagged env_bound is unaffected by a lease in ctx.metadata.
+    tool.tool_def.metadata = {}
+    assert resolve_tool_activity_config(tool, 'env_tool', {}, ctx_with_lease) == {}
+
+    # metadata['temporal'] and env_bound combined: the lease's task_queue applies on top of
+    # the explicit per-tool activity config, not instead of it.
+    tool.tool_def.metadata = {
+        'temporal': ActivityConfig(summary='env tool'),
+        'env_bound': True,
+    }
+    resolved = resolve_tool_activity_config(tool, 'env_tool', {}, ctx_with_lease)
+    assert resolved == {'summary': 'env tool', 'task_queue': 'env-abc123'}
+
+    # metadata['temporal'] = False (activity disabled) short-circuits before env_bound routing
+    # is even considered -- there's no activity to route.
+    tool.tool_def.metadata = {'temporal': False, 'env_bound': True}
+    assert resolve_tool_activity_config(tool, 'env_tool', {}, ctx_with_lease) is False
+
+
 async def test_durability_process_event_stream_fires_live_inside_activity(client: Client):
     """ProcessEventStream (outer capability) sees live events emitted inside the Temporal activity.
 
@@ -6910,3 +6966,81 @@ async def test_durability_temporalizes_capability_contributed_toolsets(allow_mod
             task_queue=TASK_QUEUE,
         )
         assert output == 'activity'
+
+
+# --- env_bound task-queue routing (pydantic-ai-harness durable-environment tracking issue) ---
+
+ENV_TASK_QUEUE = 'pydantic-ai-env-task-queue'
+
+
+async def env_bound_probe_tool() -> str:
+    """Tagged env_bound; should run on the leased env queue, not the shared queue."""
+    return activity.info().task_queue
+
+
+async def regular_probe_tool() -> str:
+    """Not tagged; should always run on the shared queue regardless of any lease."""
+    return activity.info().task_queue
+
+
+_env_routing_toolset = FunctionToolset(id='env_routing_toolset')
+_env_routing_toolset.add_function(env_bound_probe_tool, metadata={'env_bound': True})
+_env_routing_toolset.add_function(regular_probe_tool)
+
+_env_routing_agent = Agent(
+    TestModel(),
+    name='env_routing_agent',
+    toolsets=[_env_routing_toolset],
+    capabilities=[TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
+)
+
+
+@workflow.defn
+class EnvBoundRoutingWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> dict[str, str]:
+        # Stands in for the lease a `DurableEnvironment`-style capability would set;
+        # this test only exercises the core routing seam, not lease acquisition.
+        result = await _env_routing_agent.run(prompt, metadata={'durable_env': {'env_queue': ENV_TASK_QUEUE}})
+        return {
+            part.tool_name: part.content
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and isinstance(part.content, str)
+        }
+
+
+async def test_env_bound_tool_routes_to_leased_queue_model_activities_stay_shared(
+    allow_model_requests: None, client: Client
+):
+    """An env_bound tool's activity runs on the leased queue; everything else stays on the shared queue.
+
+    Two workers: `TASK_QUEUE` hosts the workflow and polls for the regular tool's (and the
+    model's) activities; `ENV_TASK_QUEUE` only polls for the env-bound tool's activity --
+    proving `resolve_tool_activity_config` actually injected `task_queue` into the
+    `execute_activity` call rather than just returning a config Temporal ignored.
+    """
+    async with (
+        Worker(
+            client,
+            task_queue=TASK_QUEUE,
+            workflows=[EnvBoundRoutingWorkflow],
+            plugins=[AgentPlugin(_env_routing_agent)],
+        ),
+        Worker(
+            client,
+            task_queue=ENV_TASK_QUEUE,
+            plugins=[AgentPlugin(_env_routing_agent)],
+        ),
+    ):
+        queues = await client.execute_workflow(
+            EnvBoundRoutingWorkflow.run,
+            args=['irrelevant, TestModel calls every tool automatically'],
+            id=EnvBoundRoutingWorkflow.__name__,
+            task_queue=TASK_QUEUE,
+        )
+
+    # The model-request activity and the regular tool never leave the shared queue; only the
+    # env_bound tool is routed to the leased queue.
+    assert queues['env_bound_probe_tool'] == ENV_TASK_QUEUE
+    assert queues['regular_probe_tool'] == TASK_QUEUE
