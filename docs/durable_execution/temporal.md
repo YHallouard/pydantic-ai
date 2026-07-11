@@ -200,6 +200,19 @@ To account for these limitations, tool functions and the [event stream handler](
 Specifically, only the `deps`, `run_id`, `metadata`, `retries`, `tool_call_id`, `tool_name`, `tool_call_approved`, `tool_call_metadata`, `retry`, `max_retries`, `run_step`, `usage`, `usage_limits`, and `partial_output` fields are available by default, and trying to access `model`, `prompt`, `messages`, or `tracer` will raise an error.
 If you need one or more of these attributes to be available inside activities, you can create a [`TemporalRunContext`][pydantic_ai.durable_exec.temporal.TemporalRunContext] subclass with custom `serialize_run_context` and `deserialize_run_context` class methods and pass it as the `run_context_type` argument to [`TemporalDurability`][pydantic_ai.durable_exec.temporal.TemporalDurability] (or [`TemporalAgent`][pydantic_ai.durable_exec.temporal.TemporalAgent]).
 
+### Nested Agent Runs
+
+A tool that calls [`Agent.run()`][pydantic_ai.agent.Agent.run] on another agent (a sub-agent, or "delegation" pattern) needs `metadata={'temporal': False}` on that tool. Without it, the entire nested run — every one of its own model requests and tool calls — collapses into a single activity: no per-call retries, no durability for anything the sub-agent does, and a nested `Agent.run_stream()`/`iter()` call would be just as unsupported as it is for the [outer agent](#streaming).
+
+```python {title="temporal_nested_agent.py" test="skip" lint="skip"}
+@toolset.tool(metadata={'temporal': False})
+async def delegate_to_specialist(ctx: RunContext[Deps], task: str) -> str:
+    result = await specialist_agent.run(task, deps=ctx.deps)
+    return result.output
+```
+
+With `metadata={'temporal': False}`, the sub-agent's own model/tool calls become first-class Temporal activities again — but every one of its events still lands in the *parent* workflow's history, so a delegation-heavy agent reaches the [history limit](#long-running-agents) faster than one that doesn't delegate. This is a simple, correct default for occasional delegation; an agent that nests sub-agent runs heavily should keep this in mind when tuning `continue_as_new_min_requests`.
+
 ### Streaming
 
 Because Temporal activities cannot stream output directly to the activity call site, [`Agent.run_stream()`][pydantic_ai.agent.Agent.run_stream], [`Agent.run_stream_events()`][pydantic_ai.agent.Agent.run_stream_events], and [`Agent.iter()`][pydantic_ai.agent.Agent.iter] are not supported.
