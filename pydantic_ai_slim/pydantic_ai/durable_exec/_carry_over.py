@@ -32,11 +32,14 @@ class AgentCarryOver:
     usage: _usage.RunUsage
     """Usage accumulated so far, to resume with as `usage`."""
 
-    capability_state: dict[str, Any]
-    """Per-capability state contributed by `AbstractCapability.on_continue_as_new`, keyed by capability id."""
-
     metadata: dict[str, Any]
-    """Snapshot of `RunContext.metadata` at the pause point (e.g. a durable environment lease)."""
+    """Snapshot of `RunContext.metadata` at the pause point.
+
+    The general-purpose bag for any capability's own state that needs to survive the pause (e.g. a
+    durable environment lease) — a capability that wants to carry something across the boundary
+    reads and writes it here like any other run-scoped state, the same way it already would within
+    a single run. No dedicated per-capability hook is needed for this.
+    """
 
 
 class AgentRunPaused(Exception):
