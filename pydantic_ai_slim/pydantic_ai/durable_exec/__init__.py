@@ -9,4 +9,13 @@ capability you attach to an [`Agent`][pydantic_ai.Agent]:
   [`DBOSDurability`][pydantic_ai.durable_exec.dbos.DBOSDurability]
 - [`pydantic_ai.durable_exec.prefect`][pydantic_ai.durable_exec.prefect] —
   [`PrefectDurability`][pydantic_ai.durable_exec.prefect.PrefectDurability]
+
+[`AgentCarryOver`][pydantic_ai.durable_exec.AgentCarryOver] and
+[`AgentRunPaused`][pydantic_ai.durable_exec.AgentRunPaused] are shared across engines: any
+durability capability can raise `AgentRunPaused` to signal that a run should stop and resume in a
+fresh run rather than continue in the current one.
 """
+
+from ._carry_over import AgentCarryOver, AgentRunPaused
+
+__all__ = ['AgentCarryOver', 'AgentRunPaused']
