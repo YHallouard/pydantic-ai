@@ -14,6 +14,7 @@ else:
 
 
 if TYPE_CHECKING:
+    from .durable_exec import AgentCarryOver
     from .messages import ModelResponse, RetryPromptPart
 
 __all__ = (
@@ -21,6 +22,7 @@ __all__ = (
     'CallDeferred',
     'ApprovalRequired',
     'SkipModelRequest',
+    'AgentRunPaused',
     'SkipToolValidation',
     'SkipToolExecution',
     'UserError',
@@ -128,6 +130,30 @@ class SkipModelRequest(Exception):
 
     def __init__(self, response: ModelResponse):
         self.response = response
+        super().__init__()
+
+
+class AgentRunPaused(Exception):
+    """Exception to raise (typically from a `wrap_model_request` hook) to pause an agent run.
+
+    Not a failure: a durability capability raises this to signal that the run should stop and be
+    resumed in a fresh run (e.g. via Temporal's `continue_as_new`) rather than continue in the
+    current one. The caller — typically
+    [`PydanticAIWorkflow.run_agent`][pydantic_ai.durable_exec.temporal.PydanticAIWorkflow.run_agent],
+    or user workflow code driving `agent.run()` directly — is responsible for catching it and
+    starting a new run seeded with `carry_over`.
+
+    Not routed through
+    [`on_model_request_error`][pydantic_ai.capabilities.AbstractCapability.on_model_request_error]
+    (same carve-out as `SkipModelRequest`/`ModelRetry`). Must also never be swallowed by a broader
+    catch-and-recover elsewhere in a capability chain (e.g. `wrap_run`) — like
+    `asyncio.CancelledError`, always re-raise it if caught generically.
+    """
+
+    carry_over: AgentCarryOver
+
+    def __init__(self, carry_over: AgentCarryOver):
+        self.carry_over = carry_over
         super().__init__()
 
 

@@ -656,8 +656,9 @@ class AbstractCapability(ABC, Generic[AgentDepsT]):
         **Raise** [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] to retry the model request
         with a retry prompt instead of recovering or propagating.
 
-        Not called for [`SkipModelRequest`][pydantic_ai.exceptions.SkipModelRequest]
-        or [`ModelRetry`][pydantic_ai.exceptions.ModelRetry].
+        Not called for [`SkipModelRequest`][pydantic_ai.exceptions.SkipModelRequest],
+        [`ModelRetry`][pydantic_ai.exceptions.ModelRetry], or
+        [`AgentRunPaused`][pydantic_ai.exceptions.AgentRunPaused].
         """
         raise error
 

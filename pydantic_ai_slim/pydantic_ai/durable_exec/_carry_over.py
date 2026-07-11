@@ -9,7 +9,7 @@ from pydantic import ConfigDict, with_config
 
 from pydantic_ai import messages as _messages, usage as _usage
 
-__all__ = ['AgentCarryOver', 'AgentRunPaused']
+__all__ = ['AgentCarryOver']
 
 
 @dataclass
@@ -21,7 +21,7 @@ class AgentCarryOver:
     [`TemporalDurability`][pydantic_ai.durable_exec.temporal.TemporalDurability]) when it decides
     a run should pause rather than continue in the current workflow/step/task run — for Temporal,
     ahead of `workflow.continue_as_new`. Carried by
-    [`AgentRunPaused`][pydantic_ai.durable_exec.AgentRunPaused] to the caller, which is
+    [`AgentRunPaused`][pydantic_ai.exceptions.AgentRunPaused] to the caller, which is
     responsible for resuming the run with this state (e.g. via `message_history=carry_over.messages`)
     in the new run.
     """
@@ -40,24 +40,3 @@ class AgentCarryOver:
     reads and writes it here like any other run-scoped state, the same way it already would within
     a single run. No dedicated per-capability hook is needed for this.
     """
-
-
-class AgentRunPaused(Exception):
-    """Exception to raise (typically from a `wrap_model_request` hook) to pause an agent run.
-
-    Not a failure: a durability capability raises this to signal that the run should stop and be
-    resumed in a fresh run (e.g. via Temporal's `continue_as_new`) rather than continue in the
-    current one. The caller — typically
-    [`PydanticAIWorkflow.run_agent`][pydantic_ai.durable_exec.temporal.PydanticAIWorkflow.run_agent],
-    or user workflow code driving `agent.run()` directly — is responsible for catching it and
-    starting a new run seeded with `carry_over`.
-
-    Must never be routed through capability error-recovery hooks (`on_model_request_error`,
-    `on_run_error`, etc.) — like `asyncio.CancelledError`, always re-raise it if caught generically.
-    """
-
-    carry_over: AgentCarryOver
-
-    def __init__(self, carry_over: AgentCarryOver):
-        self.carry_over = carry_over
-        super().__init__()

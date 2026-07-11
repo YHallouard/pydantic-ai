@@ -974,7 +974,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         return await self._make_request(ctx)
 
     @asynccontextmanager
-    async def stream(
+    async def stream(  # noqa: C901
         self,
         ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, T]],
     ) -> AsyncGenerator[result.AgentStream[DepsT, T]]:
@@ -1155,6 +1155,8 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                         model_response = await wrap_task
                     except exceptions.ModelRetry:
                         raise  # Propagate to outer handler
+                    except exceptions.AgentRunPaused:
+                        raise  # Propagate: a durability capability wants to pause the run, not recover it
                     except Exception as e:
                         model_response = await ctx.deps.root_capability.on_model_request_error(
                             run_context, request_context=wrap_request_context, error=e
@@ -1249,6 +1251,8 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                 model_response = e.response
             except exceptions.ModelRetry:
                 raise  # Propagate to outer handler
+            except exceptions.AgentRunPaused:
+                raise  # Propagate: a durability capability wants to pause the run, not recover it
             except Exception as e:
                 model_response = await ctx.deps.root_capability.on_model_request_error(
                     run_context, request_context=request_context, error=e
@@ -1553,6 +1557,8 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                 return exc.response
             if isinstance(exc, exceptions.ModelRetry):
                 raise exc
+            if isinstance(exc, exceptions.AgentRunPaused):
+                raise exc  # Propagate: a durability capability wants to pause the run, not recover it
             return await ctx.deps.root_capability.on_model_request_error(
                 run_context, request_context=request_context, error=exc
             )
