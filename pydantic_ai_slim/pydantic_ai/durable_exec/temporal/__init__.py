@@ -26,6 +26,7 @@ from ._agent import TemporalAgent  # pyright: ignore[reportDeprecated]
 from ._durability import TemporalDurability
 from ._logfire import LogfirePlugin
 from ._run_context import TemporalRunContext
+from ._subagent_workflow import SubAgentRunParams, SubAgentRunResult, SubAgentWorkflow
 from ._toolset import DurableEnvironmentLease, TemporalWrapperToolset
 from ._workflow import PydanticAIWorkflow
 
@@ -33,6 +34,9 @@ __all__ = [
     'TemporalAgent',
     'TemporalDurability',
     'PydanticAIPlugin',
+    'SubAgentRunParams',
+    'SubAgentRunResult',
+    'SubAgentWorkflow',
     'LogfirePlugin',
     'AgentPlugin',
     'TemporalRunContext',
