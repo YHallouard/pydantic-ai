@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import ConfigDict, with_config
 from pydantic.errors import PydanticUserError
@@ -27,6 +27,7 @@ from pydantic_ai.capabilities.abstract import (
     WrapModelRequestHandler,
     WrapRunHandler,
 )
+from pydantic_ai.durable_exec import AgentCarryOver
 from pydantic_ai.durable_exec._base import BaseDurabilityCapability
 from pydantic_ai.durable_exec._runtime_toolsets import reject_unsupported_runtime_toolsets
 from pydantic_ai.durable_exec._utils import (
@@ -35,7 +36,7 @@ from pydantic_ai.durable_exec._utils import (
     capture_event_stream,
     disable_threads,
 )
-from pydantic_ai.exceptions import UnexpectedModelBehavior, UserError
+from pydantic_ai.exceptions import AgentRunPaused, UnexpectedModelBehavior, UserError
 from pydantic_ai.messages import AgentStreamEvent, ModelResponse
 from pydantic_ai.models import (
     Model,
@@ -190,6 +191,8 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
         model_activity_config: ActivityConfig | None = None,
         toolset_activity_config: dict[str, ActivityConfig] | None = None,
         run_context_type: type[TemporalRunContext[AgentDepsT]] = TemporalRunContext[AgentDepsT],
+        continue_as_new: Literal['auto'] | Literal[False] = 'auto',
+        continue_as_new_min_requests: int = 10,
     ):
         """Create a TemporalDurability capability.
 
@@ -224,6 +227,17 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
                 merged on top of the base config.
             run_context_type: The `TemporalRunContext` subclass for run context
                 serialization/deserialization.
+            continue_as_new: When `'auto'` (default), a run raises
+                [`AgentRunPaused`][pydantic_ai.exceptions.AgentRunPaused] once Temporal suggests
+                `continue_as_new` (history approaching its limits) and at least
+                `continue_as_new_min_requests` model requests have been made. Set to `False` to
+                disable detection and preserve today's behavior (the run keeps going until it hits
+                Temporal's hard history limit and fails).
+            continue_as_new_min_requests: Floor on the number of model requests before
+                `continue_as_new` is ever suggested, regardless of what Temporal reports. Guards
+                against a pathologically tight continue-as-new loop; if a run's history grows too
+                fast per step to make this floor practical, trim message history instead of
+                lowering it.
 
         Note:
             Per-tool activity config (custom timeouts, retry policies, or disabling
@@ -241,6 +255,8 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
         super().__init__(models=models, event_stream_handler=event_stream_handler)
         self.run_context_type = run_context_type
         self._deps_type = deps_type
+        self._continue_as_new = continue_as_new
+        self._continue_as_new_min_requests = continue_as_new_min_requests
 
         # Normalize the activity config on copies: mutating the caller's `ActivityConfig` or a
         # `RetryPolicy` shared with other activities would leak the non-retryable entries into
@@ -592,6 +608,7 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
             return await handler(request_context)
 
         self._validate_model_request_parameters(request_context.model_request_parameters)
+        self._maybe_pause_for_continue_as_new(ctx, request_context)
 
         # Prefer the run's original model-id string (provenance) as the selection token;
         # a model swapped in by an outer capability falls back to `_find_model_id` on
@@ -656,6 +673,32 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
     def _validate_model_request_parameters(self, model_request_parameters: ModelRequestParameters) -> None:
         if model_request_parameters.allow_image_output:
             raise UserError('Image output is not supported with Temporal because of the 2MB payload size limit.')
+
+    def _maybe_pause_for_continue_as_new(
+        self,
+        ctx: RunContext[AgentDepsT],
+        request_context: ModelRequestContext,
+    ) -> None:
+        """Raise `AgentRunPaused` if Temporal suggests continue-as-new and the floor is met.
+
+        Called at the top of `wrap_model_request`, the only point in the agent loop where no tool
+        batch or stream is in flight -- the sole coherent cut point: everything up to and including
+        the previous step's tool returns is already in `request_context.messages`, and nothing has
+        been sent to the model yet for this step.
+        """
+        if self._continue_as_new is False:
+            return
+        if ctx.run_step < self._continue_as_new_min_requests:
+            return
+        if not workflow.info().is_continue_as_new_suggested():
+            return
+        raise AgentRunPaused(
+            AgentCarryOver(
+                messages=list(request_context.messages),
+                usage=ctx.usage,
+                metadata=dict(ctx.metadata or {}),
+            )
+        )
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
         """Replace leaf toolsets with their Temporal-wrapped versions."""
