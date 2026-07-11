@@ -410,6 +410,48 @@ When using Temporal, it's recommended to not use [HTTP Request Retries](../retri
 
 You can customize Temporal's retry policy using [activity configuration](#activity-configuration).
 
+## Long-Running Agents
+
+Temporal workflow histories have a hard size limit (around 50,000 events / 50MB). An agent run that keeps going — a long tool-calling loop, a chat that accumulates many turns — will eventually hit it and fail. Temporal's answer is [`continue_as_new`](https://docs.temporal.io/develop/python/continue-as-new): a fresh workflow execution starts with a clean history, seeded with whatever state the previous execution hands it.
+
+By default, [`TemporalDurability`][pydantic_ai.durable_exec.temporal.TemporalDurability] detects when Temporal suggests a continue-as-new (`continue_as_new='auto'`, the default) and raises [`AgentRunPaused`][pydantic_ai.exceptions.AgentRunPaused] the next time it's safe to stop — right before a model request, the only point in the agent loop where no tool batch or stream is in flight. [`PydanticAIWorkflow.run_agent()`][pydantic_ai.durable_exec.temporal.PydanticAIWorkflow.run_agent] catches it and calls `workflow.continue_as_new` for you, given a `continue_args` callable that rebuilds your `@workflow.run` method's arguments:
+
+```python {title="temporal_continue_as_new.py" test="skip"}
+from pydantic_ai import Agent
+from pydantic_ai.durable_exec import AgentCarryOver
+from pydantic_ai.durable_exec.temporal import PydanticAIWorkflow, TemporalDurability
+from temporalio import workflow
+
+agent = Agent(
+    'openai:gpt-5.2',
+    name='chat_agent',
+    capabilities=[TemporalDurability()],  # (1)!
+)
+
+
+@workflow.defn
+class ChatWorkflow(PydanticAIWorkflow):
+    @workflow.run
+    async def run(self, prompt: str, carry_over: AgentCarryOver | None = None) -> str:
+        result = await self.run_agent(  # (2)!
+            agent,
+            prompt,
+            carry_over=carry_over,
+            continue_args=lambda co: (prompt, co),  # (3)!
+        )
+        return result.output
+```
+
+1. `continue_as_new='auto'` is the default — no extra configuration needed to opt in.
+2. `run_agent()` seeds `message_history`, `usage`, and `metadata` from `carry_over` when resuming, and calls `agent.run()` otherwise.
+3. Rebuilds this `@workflow.run` method's own arguments (`prompt`, plus the carry-over as the trailing parameter) for the fresh execution. Return whatever arguments your method needs to pick up where it left off.
+
+Without a `continue_args` callable, a pause raises [`UserError`][pydantic_ai.exceptions.UserError] instead of silently producing a non-durable run that will eventually fail once history fills up. Pass `continue_as_new=False` to `TemporalDurability` to disable detection entirely and keep today's behavior (run until Temporal's hard history limit).
+
+`continue_as_new_min_requests` (default `10`) puts a floor on the number of model requests before a pause is ever considered, regardless of what Temporal reports — a guard against a pathologically tight continue-as-new loop. If a run's history grows too fast per step to make the default floor practical, trim message history instead of lowering it.
+
+If you're not using [`PydanticAIWorkflow`][pydantic_ai.durable_exec.temporal.PydanticAIWorkflow] as your workflow's base class, catch `AgentRunPaused` yourself and call `workflow.continue_as_new(...)` with `carry_over.messages`/`carry_over.usage`/`carry_over.metadata` — that's all `run_agent()` does under the hood.
+
 ## Observability with Logfire
 
 Temporal generates telemetry events and metrics for each workflow and activity execution, and Pydantic AI generates events for each agent run, model request and tool call. These can be sent to [Pydantic Logfire](../logfire.md) to get a complete picture of what's happening in your application.

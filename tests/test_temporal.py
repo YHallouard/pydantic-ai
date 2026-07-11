@@ -71,6 +71,7 @@ from pydantic_ai.capabilities import (
 )
 from pydantic_ai.capabilities.abstract import AbstractCapability
 from pydantic_ai.direct import model_request_stream
+from pydantic_ai.durable_exec import AgentCarryOver
 from pydantic_ai.exceptions import (
     ApprovalRequired,
     CallDeferred,
@@ -8195,3 +8196,169 @@ async def test_env_bound_tool_routes_to_leased_queue_model_activities_stay_share
     # env_bound tool is routed to the leased queue.
     assert queues['env_bound_probe_tool'] == ENV_TASK_QUEUE
     assert queues['regular_probe_tool'] == TASK_QUEUE
+
+
+# --- Continue-as-new ---
+
+
+def _continue_as_new_model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Calls `get_country` once, then answers from its result -- two model requests needed,
+    so a floor of 2 pauses right before the second one, after the first request's tool call has
+    already been resolved and appended to history."""
+    for msg in reversed(messages):
+        for part in msg.parts:
+            if isinstance(part, ToolReturnPart):
+                return ModelResponse(parts=[TextPart(content=f'Done: {part.content}')])
+    if info.function_tools:
+        return ModelResponse(parts=[ToolCallPart(tool_name='get_country', args='{}')])
+    return ModelResponse(parts=[TextPart(content='no tools')])  # pragma: no cover
+
+
+_continue_as_new_toolset = FunctionToolset[Deps](tools=[get_country], id='continue_as_new_country')
+_continue_as_new_fn_model = FunctionModel(_continue_as_new_model_fn)
+
+_continue_as_new_durability = TemporalDurability[Deps](
+    deps_type=Deps,
+    activity_config=BASE_ACTIVITY_CONFIG,
+    continue_as_new='auto',
+    continue_as_new_min_requests=2,
+)
+_continue_as_new_agent = Agent(
+    _continue_as_new_fn_model,
+    deps_type=Deps,
+    toolsets=[_continue_as_new_toolset],
+    capabilities=[_continue_as_new_durability],
+    name='continue_as_new_agent',
+)
+
+
+@workflow.defn
+class ContinueAsNewWorkflow(PydanticAIWorkflow):
+    @workflow.run
+    async def run(self, prompt: str, deps: Deps, carry_over: AgentCarryOver | None = None) -> str:
+        result = await self.run_agent(
+            _continue_as_new_agent,
+            prompt,
+            deps=deps,
+            carry_over=carry_over,
+            continue_args=lambda co: (prompt, deps, co),
+        )
+        return cast(str, result.output)
+
+
+_continue_as_new_never_durability = TemporalDurability[Deps](
+    deps_type=Deps,
+    activity_config=BASE_ACTIVITY_CONFIG,
+    continue_as_new=False,
+)
+_continue_as_new_never_agent = Agent(
+    _continue_as_new_fn_model,
+    deps_type=Deps,
+    toolsets=[FunctionToolset[Deps](tools=[get_country], id='continue_as_new_never_country')],
+    capabilities=[_continue_as_new_never_durability],
+    name='continue_as_new_never_agent',
+)
+
+
+@workflow.defn
+class ContinueAsNewDisabledWorkflow(PydanticAIWorkflow):
+    @workflow.run
+    async def run(self, prompt: str, deps: Deps) -> str:
+        result = await self.run_agent(_continue_as_new_never_agent, prompt, deps=deps)
+        return cast(str, result.output)
+
+
+@workflow.defn
+class ContinueAsNewMissingArgsWorkflow(PydanticAIWorkflow):
+    @workflow.run
+    async def run(self, prompt: str, deps: Deps) -> str:
+        # No `continue_args` -- a pause must surface as a clear `UserError`, not hang or crash oddly.
+        result = await self.run_agent(_continue_as_new_agent, prompt, deps=deps)
+        return cast(str, result.output)
+
+
+def _continued_as_new_event_count(history: WorkflowHistory) -> int:
+    return sum(1 for event in history.events if event.HasField('workflow_execution_continued_as_new_event_attributes'))
+
+
+async def test_continue_as_new_pauses_and_resumes(client: Client):
+    """`TemporalDurability(continue_as_new='auto')` pauses once the floor is met and Temporal
+    suggests continue-as-new; `PydanticAIWorkflow.run_agent` transparently restarts the workflow
+    with resumed state via `continue_args`. The final output matches what an uninterrupted run
+    would produce -- proof that `AgentCarryOver.messages` correctly seeds the new run's
+    `message_history` (the model only answers once it sees the tool return already in history,
+    it never re-invokes the tool on the second run).
+    """
+    with patch('temporalio.workflow.Info.is_continue_as_new_suggested', return_value=True):
+        async with Worker(
+            client,
+            task_queue=TASK_QUEUE,
+            workflows=[ContinueAsNewWorkflow],
+            plugins=[AgentPlugin(_continue_as_new_agent)],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            wf_id = 'test_continue_as_new_pauses_and_resumes'
+            handle = await client.start_workflow(
+                ContinueAsNewWorkflow.run,
+                args=['What country?', Deps(country='France')],
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            output = await handle.result()
+
+    assert output == 'Done: France'
+    # `handle` (from `start_workflow`) is pinned to the first run's run_id -- a fresh
+    # `get_workflow_handle(wf_id)` with no run_id tracks the *current* (post-continue-as-new) run,
+    # whose history never contains the ContinuedAsNew event that closed out the run before it.
+    first_run_history = await client.get_workflow_handle(wf_id, run_id=handle.first_execution_run_id).fetch_history()
+    assert _continued_as_new_event_count(first_run_history) == 1
+
+
+async def test_continue_as_new_disabled_preserves_current_behavior(client: Client):
+    """`continue_as_new=False` never pauses, even when Temporal suggests it -- today's behavior
+    (run until Temporal's hard history limit) is unchanged."""
+    with patch('temporalio.workflow.Info.is_continue_as_new_suggested', return_value=True):
+        async with Worker(
+            client,
+            task_queue=TASK_QUEUE,
+            workflows=[ContinueAsNewDisabledWorkflow],
+            plugins=[AgentPlugin(_continue_as_new_never_agent)],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            wf_id = 'test_continue_as_new_disabled_preserves_current_behavior'
+            output = await client.execute_workflow(
+                ContinueAsNewDisabledWorkflow.run,
+                args=['What country?', Deps(country='Spain')],
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+
+    assert output == 'Done: Spain'
+    history = await client.get_workflow_handle(wf_id).fetch_history()
+    assert _continued_as_new_event_count(history) == 0
+
+
+async def test_continue_as_new_without_continue_args_raises_clear_error(client: Client):
+    """A pause with no `continue_args` given to `run_agent` surfaces as a `UserError` -- better a
+    clear, immediate failure than a silently non-durable run or an unhandled crash."""
+    with patch('temporalio.workflow.Info.is_continue_as_new_suggested', return_value=True):
+        async with Worker(
+            client,
+            task_queue=TASK_QUEUE,
+            workflows=[ContinueAsNewMissingArgsWorkflow],
+            plugins=[AgentPlugin(_continue_as_new_agent)],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            with workflow_raises(
+                UserError,
+                'Agent run paused for continue-as-new, but `run_agent()` was not given a '
+                "`continue_args` callable to rebuild this `@workflow.run` method's arguments "
+                'from the `AgentCarryOver`. Pass one (or set `continue_as_new=False` on the '
+                'TemporalDurability capability to disable pausing).',
+            ):
+                await client.execute_workflow(
+                    ContinueAsNewMissingArgsWorkflow.run,
+                    args=['What country?', Deps(country='Germany')],
+                    id='test_continue_as_new_without_continue_args_raises_clear_error',
+                    task_queue=TASK_QUEUE,
+                )
