@@ -29,9 +29,11 @@ from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameter
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, RunContext
-from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, WrapperToolset
 
 from ._agent import DBOSParallelExecutionMode
+from ._function_toolset import DBOSFunctionToolset
+from ._toolset import toolset_needs_dbos_wrapping
 from ._utils import StepConfig
 
 
@@ -43,7 +45,8 @@ class DBOSDurability(BaseDurabilityCapability[AgentDepsT]):
     handling through DBOS steps when the agent runs inside a DBOS workflow. Call
     `agent.run()` inside your own `@DBOS.workflow` to make that run durable;
     outside a workflow the capability is transparent and the run is a normal,
-    non-durable agent run.
+    non-durable agent run. Tools tagged `nested_agent_run` get their own DBOS
+    workflow (see `resolve_tool_workflow_config`).
 
     The capability discovers the agent's model, name, and toolsets
     automatically via `for_agent()`.
@@ -249,7 +252,13 @@ class DBOSDurability(BaseDurabilityCapability[AgentDepsT]):
         )
 
     def _dbosify_leaf_toolsets(self, toolset: AbstractToolset[AgentDepsT]) -> None:
-        """Wrap MCP leaf toolsets as DBOS steps."""
+        """Wrap MCP leaf toolsets as DBOS steps, and function toolsets that need it as DBOS workflows.
+
+        A `FunctionToolset` is only wrapped (and only then required to have an `id`) when at least
+        one of its tools is tagged `nested_agent_run`/`dbos_workflow` (see `toolset_needs_dbos_wrapping`).
+        Untagged function toolsets are left exactly as-is: DBOS has always run them inline, and
+        that default doesn't change for callers who don't use this feature.
+        """
 
         def dbosify(ts: AbstractToolset[Any]) -> AbstractToolset[Any]:
             try:
@@ -288,6 +297,17 @@ class DBOSDurability(BaseDurabilityCapability[AgentDepsT]):
                     )
                     self._dbos_toolsets_by_id[ts.id] = wrapped
                     return wrapped
+
+            if isinstance(ts, FunctionToolset) and toolset_needs_dbos_wrapping(ts.tools):
+                if ts.id is None:
+                    raise UserError(
+                        "A tool in this toolset is tagged 'nested_agent_run' or 'dbos_workflow', which "
+                        'needs its own DBOS workflow, so the toolset needs a unique `id` in order to be '
+                        "used with DBOS. The ID will be used to identify the toolset's workflows."
+                    )
+                function_wrapped = DBOSFunctionToolset(ts, name_prefix=self.name, agent=self._agent)
+                self._dbos_toolsets_by_id[ts.id] = function_wrapped
+                return function_wrapped
 
             return ts
 
@@ -353,7 +373,7 @@ class DBOSDurability(BaseDurabilityCapability[AgentDepsT]):
         return await handler(request_context)
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
-        """Replace MCP leaf toolsets with their DBOS-wrapped versions."""
+        """Replace MCP and tagged-function leaf toolsets with their DBOS-wrapped versions."""
         self._reject_runtime_toolsets(toolset)
 
         if not self._dbos_toolsets_by_id:
