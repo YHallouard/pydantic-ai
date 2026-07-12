@@ -120,6 +120,12 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             'google.auth',
             # Used by fastmcp via py-key-value-aio
             'beartype',
+            # `pydantic`'s dataclass/annotation handling lazily imports `annotated_types` on first
+            # use of a constrained type (e.g. building a `TypeAdapter` for a dataclass field).
+            # Activities never trip this (they aren't sandboxed), but decoding a tool-call child
+            # workflow's params (`ToolCallWorkflowParams`/`CallToolParams`) happens inside the
+            # workflow sandbox itself -- the first such decode is what triggers the lazy import.
+            'annotated_types',
             # Imported inside `logfire._internal.json_encoder` when running `logfire.info` inside an activity with attributes to serialize
             'attrs',
             # Imported inside `logfire._internal.json_schema` when running `logfire.info` inside an activity with attributes to serialize
