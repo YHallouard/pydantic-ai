@@ -44,7 +44,7 @@ class ToolCallWorkflowParams:
     call: CallToolParams
 
 
-@workflow.defn(name='pydantic_ai__tool_call')
+@workflow.defn(name='pydantic_ai__tool_call', failure_exception_types=[Exception])
 class ToolCallWorkflow:
     """Generic workflow executing a single tool call as a child workflow.
 
@@ -54,6 +54,16 @@ class ToolCallWorkflow:
     `agent.run()` on an agent carrying its own `TemporalDurability` -- becomes activities of this
     child workflow, so a long-running tool doesn't collapse into a single activity and doesn't
     bloat the parent workflow's history.
+
+    `failure_exception_types=[Exception]` mirrors activity semantics: an activity's uncaught
+    exception always fails the activity (surfaced to the caller per its retry policy), but a
+    workflow's uncaught exception only becomes a genuine failure if its type is in
+    `workflow_failure_exception_types` -- anything else *suspends the workflow via task failure*
+    (retried indefinitely, never surfaced) per the Temporal SDK's non-determinism protection. A
+    tool body raising a plain `RuntimeError` would otherwise hang the parent forever instead of
+    failing the tool call. Scoped to this one class, not `PydanticAIPlugin`'s worker-wide
+    `workflow_failure_exception_types`, so it doesn't change failure semantics for a user's own
+    workflows.
 
     Started automatically by `TemporalFunctionToolset` for tools tagged
     `metadata={'temporal_child_workflow': ...}`; registered on the worker automatically by
