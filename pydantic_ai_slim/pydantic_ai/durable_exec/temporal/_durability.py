@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal, cast
 
-from pydantic import ConfigDict, with_config
+from pydantic import ConfigDict, TypeAdapter, with_config
 from pydantic.errors import PydanticUserError
 from pydantic_core import PydanticSerializationError
 from temporalio import activity, workflow
@@ -50,6 +50,8 @@ from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
 
 from ._run_context import TemporalRunContext, deserialize_run_context
 from ._toolset import (
+    CallToolParams,
+    CallToolResult,
     TemporalWrapperToolset,
     temporalize_toolset as _default_temporalize_toolset,
 )
@@ -511,6 +513,35 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
         `AgentPlugin`.
         """
         return self._temporal_activities
+
+    async def call_tool_in_workflow(self, toolset_id: str, call: CallToolParams, deps: Any) -> CallToolResult:
+        """Execute a tool call inline as workflow code, on behalf of `ToolCallWorkflow`.
+
+        The workflow-side mirror of the per-toolset `call_tool` activity closure: re-validate
+        `deps` (a generic workflow's `run` can't carry a per-agent annotation for the payload
+        converter, so the raw payload is validated here against the bound `deps_type`),
+        deserialize the run context with this agent bound, and call the *wrapped* (original)
+        toolset directly -- so any nested durable work the tool body does becomes activities of
+        the calling child workflow.
+        """
+        wrapper = self._temporal_toolsets_by_id.get(toolset_id)
+        if not isinstance(wrapper, TemporalWrapperToolset):
+            raise UserError(
+                f'Toolset {toolset_id!r} is not registered on agent {self.name!r}. '
+                'The worker running this child workflow must be configured with the same agent '
+                '(same toolsets) as the parent workflow.'
+            )
+        if deps is not None and self._deps_type is not None:
+            deps = TypeAdapter(self._deps_type).validate_python(deps)
+        ctx = deserialize_run_context(self.run_context_type, call.serialized_run_context, deps=deps, agent=self._agent)
+        try:
+            tool = (await wrapper.wrapped.get_tools(ctx))[call.name]
+        except KeyError as e:
+            raise UserError(
+                f'Tool {call.name!r} not found in toolset {toolset_id!r}. '
+                'Removing or renaming tools during an agent run is not supported with Temporal.'
+            ) from e
+        return await wrapper._call_tool_in_activity(call.name, call.tool_args, ctx, tool)  # pyright: ignore[reportPrivateUsage]
 
     # --- Capability hooks ---
 

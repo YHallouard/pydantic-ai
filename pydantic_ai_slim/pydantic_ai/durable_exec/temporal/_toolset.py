@@ -3,11 +3,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from pydantic import ConfigDict, Discriminator, Tag, with_config
 from temporalio import workflow
-from temporalio.workflow import ActivityConfig
+from temporalio.common import RetryPolicy
+from temporalio.workflow import ActivityConfig, ParentClosePolicy
 from typing_extensions import Self, TypedDict, assert_never
 
 from pydantic_ai import AbstractToolset, FunctionToolset, ToolsetTool, WrapperToolset
@@ -239,6 +241,58 @@ def resolve_tool_activity_config(
                 config = cast('ActivityConfig', {**config, 'task_queue': env_queue})
 
     return config
+
+
+class ChildWorkflowConfig(TypedDict, total=False):
+    """Options for running a tool as a child workflow, mirroring `workflow.execute_child_workflow` kwargs.
+
+    Set via tool metadata: `metadata={'temporal_child_workflow': True}` (all defaults) or
+    `metadata={'temporal_child_workflow': ChildWorkflowConfig(...)}`. `parent_close_policy`
+    defaults to `REQUEST_CANCEL` so a cancelled parent doesn't leave orphaned tool runs behind.
+    """
+
+    execution_timeout: timedelta
+    run_timeout: timedelta
+    task_timeout: timedelta
+    task_queue: str
+    retry_policy: RetryPolicy
+    parent_close_policy: ParentClosePolicy
+
+
+def resolve_tool_child_workflow_config(
+    tool: ToolsetTool[Any] | None,
+    tool_name: str,
+) -> ChildWorkflowConfig | None:
+    """Resolve the per-tool child-workflow config, or `None` when the tool isn't tagged.
+
+    Reads `tool.tool_def.metadata['temporal_child_workflow']` (`True` or a
+    [`ChildWorkflowConfig`][pydantic_ai.durable_exec.temporal.ChildWorkflowConfig] dict). A tool
+    tagged this way executes as a *child workflow* instead of an activity: its function body runs
+    as workflow code in [`ToolCallWorkflow`][pydantic_ai.durable_exec.temporal.ToolCallWorkflow],
+    so any I/O it performs (including a nested `agent.run()` on an agent carrying its own
+    `TemporalDurability`) becomes activities of the child, keeping the parent workflow's history
+    flat. Mutually exclusive with the `'temporal'` metadata key: the tool body is workflow code,
+    so there is no activity to configure.
+    """
+    metadata = tool.tool_def.metadata if tool is not None else None
+    if metadata is None:
+        return None
+    child_config = metadata.get('temporal_child_workflow')
+    if child_config is None:
+        return None
+    if metadata.get('temporal') is not None:
+        raise UserError(
+            f"Tool {tool_name!r} has both 'temporal' and 'temporal_child_workflow' metadata; "
+            'a tool runs either as an activity or as a child workflow, not both.'
+        )
+    if child_config is True:
+        return ChildWorkflowConfig()
+    if isinstance(child_config, dict):
+        return cast('ChildWorkflowConfig', child_config)
+    raise UserError(
+        f"Tool {tool_name!r} has invalid 'temporal_child_workflow' metadata: expected `True` or a dict "
+        f'(`ChildWorkflowConfig`), got {type(child_config).__name__}.'
+    )
 
 
 def temporalize_toolset(

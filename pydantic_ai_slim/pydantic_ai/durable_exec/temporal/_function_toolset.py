@@ -18,8 +18,10 @@ if TYPE_CHECKING:
 from ._toolset import (
     CallToolParams,
     CallToolResult,
+    ChildWorkflowConfig,
     TemporalWrapperToolset,
     resolve_tool_activity_config,
+    resolve_tool_child_workflow_config,
 )
 
 
@@ -37,6 +39,7 @@ class TemporalFunctionToolset(TemporalWrapperToolset[AgentDepsT]):
     ):
         super().__init__(toolset)
         self._agent = agent
+        self._activity_name_prefix = activity_name_prefix
         self.activity_config = activity_config
         self.tool_activity_config = tool_activity_config
         self.run_context_type = run_context_type
@@ -73,6 +76,10 @@ class TemporalFunctionToolset(TemporalWrapperToolset[AgentDepsT]):
         if not workflow.in_workflow():  # pragma: no cover
             return await super().call_tool(name, tool_args, ctx, tool)
 
+        child_workflow_config = resolve_tool_child_workflow_config(tool, name)
+        if child_workflow_config is not None:
+            return await self._call_tool_in_child_workflow(name, tool_args, ctx, tool, child_workflow_config)
+
         tool_activity_config = resolve_tool_activity_config(tool, name, self.tool_activity_config, ctx)
         if tool_activity_config is False:
             assert isinstance(tool, FunctionToolsetTool)
@@ -102,5 +109,48 @@ class TemporalFunctionToolset(TemporalWrapperToolset[AgentDepsT]):
                     ctx.deps,
                 ],
                 **activity_config,
+            )
+        )
+
+    async def _call_tool_in_child_workflow(
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[AgentDepsT],
+        tool: ToolsetTool[AgentDepsT],
+        config: ChildWorkflowConfig,
+    ) -> Any:
+        """Run a `metadata={'temporal_child_workflow': ...}` tool as a child workflow.
+
+        The child's workflow id derives from the parent's id and the tool call id, so a replay of
+        the parent re-attaches to the same child instead of starting a second one.
+        """
+        from ._tool_call_workflow import ToolCallWorkflow, ToolCallWorkflowParams
+
+        assert isinstance(tool, FunctionToolsetTool)
+        if not tool.is_async:
+            raise UserError(
+                f'Tool {name!r} is configured to run as a child workflow, but non-async tools are run in '
+                'threads which are not supported in workflow code. Make the tool function async instead.'
+            )
+        params = ToolCallWorkflowParams(
+            prefix=self._activity_name_prefix,
+            toolset_id=self.id,
+            call=CallToolParams(
+                name=name,
+                tool_args=tool_args,
+                serialized_run_context=self.run_context_type.serialize_run_context(ctx),
+                tool_def=None,
+            ),
+        )
+        assert ctx.tool_call_id is not None
+        options: dict[str, Any] = dict(config)
+        options.setdefault('parent_close_policy', workflow.ParentClosePolicy.REQUEST_CANCEL)
+        return self._unwrap_call_tool_result(
+            await workflow.execute_child_workflow(
+                ToolCallWorkflow.run,
+                args=[params, ctx.deps],
+                id=f'{workflow.info().workflow_id}--{ctx.tool_call_id}',
+                **options,
             )
         )
