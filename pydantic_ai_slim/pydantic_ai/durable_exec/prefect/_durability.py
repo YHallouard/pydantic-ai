@@ -265,6 +265,7 @@ class PrefectDurability(BaseDurabilityCapability[AgentDepsT]):
                 self._mcp_task_config,
                 self._tool_task_config,
                 {},  # per-tool config comes from tool metadata on the capability path
+                self._agent,
             )
             if isinstance(wrapped, PrefectWrapperToolset):
                 # Without an ID the wrapper can't be swapped in at run time (see

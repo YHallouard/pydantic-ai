@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from abc import ABC
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic_ai import AbstractToolset, FunctionToolset, ToolsetTool, WrapperToolset
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT
 
-from ._types import TaskConfig
+from ._types import FlowConfig, TaskConfig
+
+if TYPE_CHECKING:
+    from pydantic_ai.agent.abstract import AbstractAgent
 
 
 def resolve_tool_task_config(
@@ -43,6 +46,47 @@ def resolve_tool_task_config(
     return {}
 
 
+def resolve_tool_flow_config(
+    tool: ToolsetTool[Any] | None,
+    tool_name: str,
+) -> FlowConfig | None:
+    """Resolve the per-tool subflow config, or `None` when the tool doesn't get one.
+
+    Two metadata keys feed this, in order of precedence:
+
+    1. `'prefect_subflow'` (`True` or a [`FlowConfig`][pydantic_ai.durable_exec.prefect.FlowConfig]
+       dict) -- explicit, Prefect-specific opt-in, normally set by whoever configures a *specific*
+       agent's durability (retries, timeouts, etc. are deployment concerns), not by the toolset author.
+    2. `'nested_agent_run'` (`True`) -- an engine-neutral fact a toolset author declares about
+       their *own* tool: "this tool's body runs another agent (`agent.run()`)". Set by the tool's
+       author (e.g. a delegation/sub-agent toolset), who has no reason to know or care which
+       durability engine, if any, wraps the outer agent. `PrefectDurability` treats this as "run
+       as a subflow instead of a task" -- the natural Prefect-specific consequence of that fact,
+       decided *here*, not by the toolset. A future DBOS durability capability interprets the same
+       tag differently (its own workflow, not a subflow-vs-task distinction -- DBOS doesn't wrap
+       tools in anything by default).
+
+    An explicit `'prefect_subflow'` always wins over a `'nested_agent_run'` hint (e.g. to give it
+    a longer `timeout_seconds`).
+    """
+    if tool is None or tool.tool_def.metadata is None:
+        return None
+    metadata = tool.tool_def.metadata
+    flow_config = metadata.get('prefect_subflow')
+    if flow_config is None:
+        if metadata.get('nested_agent_run'):
+            return FlowConfig()
+        return None
+    if flow_config is True:
+        return FlowConfig()
+    if isinstance(flow_config, dict):
+        return cast('FlowConfig', flow_config)
+    raise UserError(
+        f"Tool {tool_name!r} has invalid 'prefect_subflow' metadata: expected `True` or a dict "
+        f'(`FlowConfig`), got {type(flow_config).__name__}.'
+    )
+
+
 class PrefectWrapperToolset(WrapperToolset[AgentDepsT], ABC):
     """Base class for Prefect-wrapped toolsets."""
 
@@ -63,6 +107,7 @@ def prefectify_toolset(
     mcp_task_config: TaskConfig,
     tool_task_config: TaskConfig,
     tool_task_config_by_name: dict[str, TaskConfig | None],
+    agent: AbstractAgent[AgentDepsT, Any] | None = None,
 ) -> AbstractToolset[AgentDepsT]:
     """Wrap a toolset to integrate it with Prefect.
 
@@ -71,6 +116,8 @@ def prefectify_toolset(
         mcp_task_config: The Prefect task config to use for MCP server tasks.
         tool_task_config: The default Prefect task config to use for tool calls.
         tool_task_config_by_name: Per-tool task configuration. Keys are tool names, values are TaskConfig or None.
+        agent: The agent instance to attach to the run context reconstructed inside a
+            `nested_agent_run`/`prefect_subflow`-tagged tool's subflow.
     """
     if isinstance(toolset, FunctionToolset):
         from ._function_toolset import PrefectFunctionToolset
@@ -79,6 +126,7 @@ def prefectify_toolset(
             wrapped=toolset,
             task_config=tool_task_config,
             tool_task_config=tool_task_config_by_name,
+            agent=agent,
         )
 
     try:

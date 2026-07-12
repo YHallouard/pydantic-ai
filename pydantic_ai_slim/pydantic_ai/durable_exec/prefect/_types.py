@@ -42,3 +42,30 @@ default_task_config = TaskConfig(
     log_prints=False,
     cache_policy=DEFAULT_PYDANTIC_AI_CACHE_POLICY,
 )
+
+
+class FlowConfig(TypedDict, total=False):
+    """Configuration for a subflow in Prefect, used for a tool tagged `nested_agent_run`/`prefect_subflow`.
+
+    These options are passed to the `@flow` decorator. Same field names as
+    [`TaskConfig`][pydantic_ai.durable_exec.prefect.TaskConfig] where the two overlap; no
+    `cache_policy` (a task-only concept).
+    """
+
+    retries: int
+    """Maximum number of retries for the subflow."""
+
+    retry_delay_seconds: float
+    """Delay between retries in seconds."""
+
+    timeout_seconds: float
+    """Maximum time in seconds for the subflow to complete."""
+
+    persist_result: bool
+    """Whether to persist the subflow's result."""
+
+    result_storage: ResultStorage
+    """Prefect result storage for the subflow. Should be a storage block or a block slug like `s3-bucket/my-storage`."""
+
+    log_prints: bool
+    """Whether to log print statements from the subflow."""

@@ -12,7 +12,8 @@ from ._durability import PrefectDurability
 from ._function_toolset import PrefectFunctionToolset
 from ._mcp_toolset import PrefectMCPToolset
 from ._model import PrefectModel
-from ._types import TaskConfig
+from ._toolset import resolve_tool_flow_config
+from ._types import FlowConfig, TaskConfig
 
 __all__ = [
     'PrefectAgent',
@@ -20,6 +21,8 @@ __all__ = [
     'PrefectModel',
     'PrefectMCPToolset',
     'PrefectFunctionToolset',
+    'FlowConfig',
     'TaskConfig',
     'DEFAULT_PYDANTIC_AI_CACHE_POLICY',
+    'resolve_tool_flow_config',
 ]
