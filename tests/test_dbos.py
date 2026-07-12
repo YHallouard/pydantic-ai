@@ -60,7 +60,8 @@ from .conftest import IsDatetime, IsNow, IsStr
 try:
     from dbos import DBOS, DBOSConfig, SetWorkflowID
 
-    from pydantic_ai.durable_exec.dbos import DBOSAgent, DBOSDurability, DBOSModel
+    from pydantic_ai.durable_exec.dbos import DBOSAgent, DBOSDurability, DBOSModel, resolve_tool_workflow_config
+    from pydantic_ai.durable_exec.dbos._function_toolset import DBOSFunctionToolset
     from pydantic_ai.durable_exec.dbos._mcp import DBOSMCPToolsetBase
     from pydantic_ai.durable_exec.dbos._mcp_toolset import DBOSMCPToolset
 
@@ -2882,3 +2883,182 @@ async def test_dbos_durability_continuation_resume_from_history(dbos: DBOS) -> N
     assert result.usage.output_tokens == 6
     # The continuation request ran inside the boundary — the seed wasn't re-generated.
     assert model.request_calls == 1
+
+# ==========================================
+# Nested agent runs (tools tagged 'nested_agent_run'/'dbos_workflow')
+# ==========================================
+
+
+def test_resolve_tool_workflow_config_precedence() -> None:
+    """`resolve_tool_workflow_config` precedence: explicit `dbos_workflow` wins over the generic
+    `nested_agent_run` hint; neither key means no wrapping; an invalid value raises clearly."""
+    assert resolve_tool_workflow_config(None, 'x') is None
+    assert resolve_tool_workflow_config({}, 'x') is None
+    assert resolve_tool_workflow_config({'nested_agent_run': True}, 'x') == {}
+    assert resolve_tool_workflow_config({'dbos_workflow': True}, 'x') == {}
+    assert resolve_tool_workflow_config({'dbos_workflow': {'max_recovery_attempts': 3}}, 'x') == {
+        'max_recovery_attempts': 3
+    }
+    # Explicit override wins over the generic hint, even when both are set.
+    assert resolve_tool_workflow_config(
+        {'nested_agent_run': True, 'dbos_workflow': {'max_recovery_attempts': 5}}, 'x'
+    ) == {'max_recovery_attempts': 5}
+    with pytest.raises(UserError, match="Tool 'x' has invalid 'dbos_workflow' metadata"):
+        resolve_tool_workflow_config({'dbos_workflow': 'nonsense'}, 'x')
+
+
+def test_dbos_durability_untagged_function_toolset_is_not_wrapped(dbos: DBOS) -> None:
+    """A `FunctionToolset` with no tagged tool is left exactly as-is: no `id` required, no wrapping.
+
+    This is the regression guard for the untagged path: `nested_agent_run` support must not
+    change behaviour for callers who don't use it.
+    """
+    toolset = FunctionToolset(tools=[runtime_tool])
+    agent = Agent(
+        _durability_fn_model, name='durability_untagged_fn', toolsets=[toolset], capabilities=[DBOSDurability()]
+    )
+    bound = DBOSDurability.from_agent(agent)
+    assert bound is not None
+    assert bound._dbos_toolsets_by_id == {}  # pyright: ignore[reportPrivateUsage]
+
+
+def test_dbos_durability_rejects_idless_tagged_function_toolset(dbos: DBOS) -> None:
+    """A tagged tool's toolset needs a unique `id`, same rationale as MCP toolsets."""
+
+    async def delegate(ctx: RunContext[None], task: str) -> str:  # pragma: no cover - never called
+        return task
+
+    toolset = FunctionToolset()
+    toolset.add_function(delegate, name='delegate', metadata={'nested_agent_run': True})
+
+    with pytest.raises(UserError, match='needs a unique `id` in order to be used with DBOS'):
+        Agent(
+            _durability_fn_model, name='durability_idless_tagged', toolsets=[toolset], capabilities=[DBOSDurability()]
+        )
+
+
+def test_dbos_durability_wraps_tagged_function_toolset(dbos: DBOS) -> None:
+    """DBOSDurability discovers a tagged `FunctionToolset` and wraps it, keyed by its id."""
+
+    async def delegate(ctx: RunContext[None], task: str) -> str:  # pragma: no cover - never called
+        return task
+
+    toolset = FunctionToolset(id='delegate_ts')
+    toolset.add_function(delegate, name='delegate', metadata={'nested_agent_run': True})
+
+    agent = Agent(_durability_fn_model, name='durability_tagged', toolsets=[toolset], capabilities=[DBOSDurability()])
+    bound = DBOSDurability.from_agent(agent)
+    assert bound is not None
+    assert isinstance(bound._dbos_toolsets_by_id['delegate_ts'], DBOSFunctionToolset)  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_sync_tool_tagged_dbos_workflow_raises_clear_error(dbos: DBOS) -> None:
+    """A sync tool tagged `nested_agent_run` can't be run as its own DBOS workflow (DBOS runs
+    sync tools inline in a thread, which isn't supported inside workflow code)."""
+
+    def sync_delegate(ctx: RunContext[None], task: str) -> str:  # pragma: no cover - errors before running
+        return task
+
+    toolset = FunctionToolset(id='sync_delegate_ts')
+    toolset.add_function(sync_delegate, name='sync_delegate', metadata={'nested_agent_run': True})
+
+    def call_model(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('sync_delegate', {'task': 'go'}, tool_call_id='call-1')])
+
+    agent = Agent(
+        FunctionModel(call_model), name='durability_sync_tagged', toolsets=[toolset], capabilities=[DBOSDurability()]
+    )
+
+    @DBOS.workflow()
+    async def run_it() -> str:
+        result = await agent.run('go')
+        return result.output
+
+    with workflow_raises(
+        UserError,
+        "Tool 'sync_delegate' is tagged to run as its own DBOS workflow, but DBOS runs non-async "
+        'tools inline; make the tool function async instead.',
+    ):
+        await run_it()
+
+
+async def test_dbos_durability_nested_agent_run_gets_its_own_workflow(allow_model_requests: None, dbos: DBOS) -> None:
+    """A tool tagged `nested_agent_run` that calls another agent's `run()` gets its own DBOS
+    workflow, instead of the nested run flattening into the caller's (the default -- see
+    `test_dbos_agent_run_sync_in_workflow` for the flattening case with no such tag)."""
+
+    def specialist_model_fn(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart('specialist answer')])
+
+    specialist_agent = Agent(
+        FunctionModel(specialist_model_fn), name='nested_specialist', capabilities=[DBOSDurability()]
+    )
+
+    toolset = FunctionToolset(id='nested_delegate_ts')
+
+    async def delegate(ctx: RunContext[None], task: str) -> str:
+        result = await specialist_agent.run(task)
+        return result.output
+
+    toolset.add_function(delegate, name='delegate', metadata={'nested_agent_run': True})
+
+    call_count = {'n': 0}
+
+    def parent_model_fn(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            return ModelResponse(parts=[ToolCallPart('delegate', {'task': 'go'}, tool_call_id='call-1')])
+        return ModelResponse(parts=[TextPart('done')])
+
+    parent_agent = Agent(
+        FunctionModel(parent_model_fn),
+        name='nested_parent',
+        toolsets=[toolset],
+        capabilities=[DBOSDurability()],
+    )
+
+    @DBOS.workflow()
+    async def run_parent() -> str:
+        result = await parent_agent.run('hello')
+        return result.output
+
+    output = await run_parent()
+    assert output == 'done'
+
+    child_workflows = await DBOS.list_workflows_async(name='nested_parent__delegate__tool_call')
+    assert len(child_workflows) == 1
+    assert child_workflows[0].status == 'SUCCESS'
+
+
+async def test_dbos_durability_nested_agent_run_failure_surfaces_as_tool_failure(
+    allow_model_requests: None, dbos: DBOS
+) -> None:
+    """A failure inside a tagged tool's own DBOS workflow surfaces as a normal tool failure at
+    the caller, not a hang -- unlike Temporal, DBOS doesn't need a `failure_exception_types`
+    carve-out for this (exceptions propagate through `await workflow_fn(...)` like any other
+    async call); this test pins that DBOS doesn't need the equivalent fix."""
+
+    toolset = FunctionToolset(id='boom_ts')
+
+    async def boom(ctx: RunContext[None], task: str) -> str:
+        raise RuntimeError('boom')
+
+    toolset.add_function(boom, name='boom', metadata={'nested_agent_run': True})
+
+    def parent_model_fn(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('boom', {'task': 'go'}, tool_call_id='call-1')])
+
+    parent_agent = Agent(
+        FunctionModel(parent_model_fn),
+        name='nested_boom_parent',
+        toolsets=[toolset],
+        capabilities=[DBOSDurability()],
+    )
+
+    @DBOS.workflow()
+    async def run_parent() -> str:
+        result = await parent_agent.run('hello')
+        return result.output
+
+    with workflow_raises(RuntimeError, 'boom'):
+        await run_parent()

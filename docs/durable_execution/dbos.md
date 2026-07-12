@@ -176,9 +176,32 @@ It's equivalent to the behavior of [`with agent.parallel_tool_call_execution_mod
 
 If you prefer strict ordering, you can configure the agent to run tools sequentially by setting `parallel_execution_mode='sequential'` on [`DBOSDurability`][pydantic_ai.durable_exec.dbos.DBOSDurability] (or on the deprecated [`DBOSAgent`][pydantic_ai.durable_exec.dbos.DBOSAgent]).
 
+### Nested Agent Runs
+
+A tool that calls [`Agent.run()`][pydantic_ai.agent.Agent.run] on another agent (a sub-agent, or "delegation" pattern) runs it inline by default, since DBOS already runs function tools inline: as long as the sub-agent carries its own [`DBOSDurability`][pydantic_ai.durable_exec.dbos.DBOSDurability] capability, its own model and tool calls are still checkpointed as DBOS steps -- they're just recorded as part of the *caller's* workflow (see `_install_workflow_wrappers`: an `agent.run()` called from inside an already-active DBOS workflow flattens into it rather than starting a nested one). That's often fine, but it means the sub-agent's run has no independent identity: it can't be recovered, retried, or inspected separately from the caller's own workflow.
+
+To give a delegation tool's nested run its own DBOS workflow, tag it with `metadata={'nested_agent_run': True}`, declaring the engine-neutral fact that its body runs another agent. Under DBOS, this makes the tool run as its own workflow: `DBOS.workflow_id` changes for the duration of the call, so the sub-agent's own `agent.run()` (still flattening into *this* new workflow, by the same rule as above) shows up as a distinct, independently recoverable unit instead of merging into the top-level run.
+
+```python {title="dbos_nested_agent.py" test="skip" lint="skip"}
+@toolset.tool(metadata={'nested_agent_run': True})
+async def delegate_to_specialist(ctx: RunContext[Deps], task: str) -> str:
+    result = await specialist_agent.run(task, deps=ctx.deps)
+    return result.output
+```
+
+For this to work:
+
+- The sub-agent (`specialist_agent` above) should carry its own [`DBOSDurability`][pydantic_ai.durable_exec.dbos.DBOSDurability] capability, bound at agent-construction time -- otherwise its own model requests aren't checkpointed as DBOS steps.
+- The tool's toolset needs a unique [`id`][pydantic_ai.toolsets.AbstractToolset.id] (same requirement as [`MCPToolset`][pydantic_ai.mcp.MCPToolset] above): without one, `DBOSDurability` can't derive a stable workflow name for it and raises a `UserError` at agent construction.
+- The tool must be `async` (DBOS runs non-async tools inline in a thread, which isn't supported for workflow code).
+
+`nested_agent_run` picks DBOS's default workflow config. For control over `max_recovery_attempts`, set `metadata={'dbos_workflow': DBOSWorkflowConfig(max_recovery_attempts=...)}` explicitly instead -- it takes precedence over a `nested_agent_run` hint on the same tool. This split matters for toolset authors: a toolset that isn't DBOS-specific (like a sub-agent/delegation toolset meant to work under any durability engine, or none) should only ever set `nested_agent_run`, leaving the DBOS-specific decision to whoever configures that particular agent's durability -- the same tag [Temporal's `TemporalDurability`](temporal.md#nested-agent-runs) reads to decide on a child workflow instead.
+
+A `FunctionToolset` with no tagged tool is never wrapped: this feature adds no requirements (no `id`, no behavior change) for tools that don't use it.
+
 ### Toolsets at Runtime
 
-Additional toolsets can be passed per run via `agent.run(toolsets=...)` (on both the [`DBOSDurability`][pydantic_ai.durable_exec.dbos.DBOSDurability] and `DBOSAgent` paths). Non-executing toolsets like [`ExternalToolset`][pydantic_ai.toolsets.ExternalToolset], and [`FunctionToolset`][pydantic_ai.toolsets.FunctionToolset]s whose tools DBOS runs inline, are supported. [`MCPToolset`][pydantic_ai.mcp.MCPToolset]s and dynamic toolsets must be set when constructing the agent so their steps are registered before the workflow runs; passing them at runtime raises a `UserError`.
+Additional toolsets can be passed per run via `agent.run(toolsets=...)` (on both the [`DBOSDurability`][pydantic_ai.durable_exec.dbos.DBOSDurability] and `DBOSAgent` paths). Non-executing toolsets like [`ExternalToolset`][pydantic_ai.toolsets.ExternalToolset], and [`FunctionToolset`][pydantic_ai.toolsets.FunctionToolset]s whose tools DBOS runs inline, are supported. [`MCPToolset`][pydantic_ai.mcp.MCPToolset]s and dynamic toolsets must be set when constructing the agent so their steps are registered before the workflow runs; passing them at runtime raises a `UserError`. A tool tagged `nested_agent_run` on a toolset added at runtime doesn't get its own workflow either: the tag is only discovered at agent-construction time.
 
 
 ## Step Configuration
