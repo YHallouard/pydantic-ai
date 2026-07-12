@@ -18,6 +18,7 @@ from typing import Any, TypeAlias, TypeVar
 
 from pydantic_ai._utils import disable_threads
 from pydantic_ai.agent import EventStreamHandler
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, ModelResponseStreamEvent
 from pydantic_ai.models import CompletedStreamedResponse, Model, ModelRequestParameters
 from pydantic_ai.models.wrapper import WrapperModel
@@ -31,6 +32,8 @@ __all__ = [
     'disable_threads',
     'capture_event_stream',
     'unwrap_model',
+    'DurableRunContext',
+    'strip_run_context',
 ]
 
 
@@ -160,3 +163,101 @@ async def capture_event_stream(
     async for _ in teed_stream:
         pass
     return captured
+
+
+_DURABLE_RUN_CONTEXT_FIELDS = (
+    'run_id',
+    'metadata',
+    'retries',
+    'tool_call_id',
+    'tool_name',
+    'tool_call_approved',
+    'tool_call_metadata',
+    'retry',
+    'max_retries',
+    'run_step',
+    'partial_output',
+    'usage',
+    'usage_limits',
+    'loaded_capability_ids',
+    'discovered_tool_names',
+    'capability_loaded',
+)
+"""Fields carried across a durable-execution boundary by `strip_run_context`/`DurableRunContext`.
+
+Mirrors the field set `TemporalRunContext.serialize_run_context` exposes across its JSON
+activity boundary (`durable_exec/temporal/_run_context.py`) -- deliberately the same list, kept
+in sync by hand, so a tool that works across the Temporal boundary works the same way across the
+DBOS/Prefect one. Excludes `agent` (holds the live agent -- toolsets, models, capabilities --
+none of it durably picklable/JSON-safe) and `model`/`tracer`/`prompt`/`messages`/
+`validation_context`/`model_settings`/`conversation_id`/`trace_include_content`/
+`instrumentation_version` for the same reason Temporal excludes them: not needed by the tool
+bodies this is built for (which read `deps`/`usage`/metadata, not the run's model or trace
+context), and either unpicklable/not JSON-safe or simply redundant this deep in a tool call.
+"""
+
+
+class DurableRunContext(RunContext[Any]):
+    """A `RunContext` reconstructed from a `strip_run_context` snapshot inside a durable boundary.
+
+    Only the fields in `_DURABLE_RUN_CONTEXT_FIELDS` (plus `deps`, always required) are
+    available; `agent` is `None` unless attached explicitly by the caller after construction (the
+    DBOS/Prefect wrapper toolsets do this from a live reference kept outside what got persisted,
+    not from anything serialized -- the same two-step Temporal's `deserialize_run_context` does).
+    Accessing any other `RunContext` field raises a clear `UserError` instead of `AttributeError`.
+    """
+
+    def __init__(self, deps: Any, **kwargs: Any) -> None:
+        self.__dict__ = {**kwargs, 'deps': deps}
+        self.__dict__.setdefault('agent', None)
+        self._set_dataclass_fields()
+
+    def _set_dataclass_fields(self) -> None:
+        # Restricting `__dataclass_fields__` to the populated subset is what makes
+        # `dataclasses.replace()` (used elsewhere in the tool-call chain) work against a partial
+        # object instead of erroring on the fields `strip_run_context` dropped. Kept out of
+        # `__getstate__`/pickled state (below): a `dataclasses.Field`'s `metadata` is a
+        # `mappingproxy`, which the `pickle` module DBOS/Prefect use for durable persistence can't
+        # serialize -- recomputed on the unpickled side instead.
+        setattr(
+            self,
+            '__dataclass_fields__',
+            {name: field for name, field in RunContext.__dataclass_fields__.items() if name in self.__dict__},
+        )
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if k != '__dataclass_fields__'}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__ = state
+        self._set_dataclass_fields()
+
+    def __getattribute__(self, name: str) -> Any:
+        try:
+            return super().__getattribute__(name)
+        except AttributeError as e:
+            if name in RunContext.__dataclass_fields__:
+                raise UserError(
+                    f'{self.__class__.__name__!r} object has no attribute {name!r}: it was dropped by '
+                    '`strip_run_context` when crossing the durable-execution boundary.'
+                ) from e
+            else:
+                raise e
+
+
+def strip_run_context(ctx: RunContext[Any]) -> DurableRunContext:
+    """Snapshot `ctx` into a `DurableRunContext`, dropping fields unsafe to persist durably.
+
+    Use before handing a `RunContext` to a DBOS workflow or Prefect (sub)flow: unlike a Temporal
+    activity (JSON-serialized explicitly) or a DBOS/Prefect *task* (pickled but not durably
+    persisted as replayable input), a DBOS workflow or Prefect flow run persists its call
+    arguments for recovery/observability, so a live `ctx.agent` (unpicklable: it reaches back
+    into toolsets, models, and capabilities) would either fail to pickle or bloat every recorded
+    run with the whole agent graph.
+
+    The result's `agent` is always `None`; attach a real one with
+    `result.__dict__['agent'] = agent` (and `result.__dict__['root_capability'] = agent.root_capability`
+    if the chain needs to run against it) from a reference kept outside the durable input, the way
+    Temporal's `deserialize_run_context` does for its own activity boundary.
+    """
+    return DurableRunContext(deps=ctx.deps, **{name: getattr(ctx, name) for name in _DURABLE_RUN_CONTEXT_FIELDS})
