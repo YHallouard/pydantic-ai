@@ -187,6 +187,27 @@ agent = Agent(
 3. Selector-based: [`SetToolMetadata`][pydantic_ai.capabilities.SetToolMetadata] applies the same metadata across a selection of tools (`'all'`, a name list, a dict, or a callable).
 4. `tool_task_config` sets the default config for every tool.
 
+### Nested Agent Runs
+
+A tool that calls [`Agent.run()`][pydantic_ai.agent.Agent.run] on another agent (a sub-agent, or "delegation" pattern) shouldn't run as a regular task: the entire nested run — every one of its own model requests and tool calls — would collapse into a single task, tracked in the Prefect UI as one opaque unit with no visibility into what happened inside it.
+
+The recommended approach is to tag the tool with `metadata={'nested_agent_run': True}`, declaring the engine-neutral fact that its body runs another agent. Under Prefect, this makes the tool run as a **subflow**: the tool's body executes as its own flow run, so the sub-agent's own model and tool calls become first-class tasks *of the subflow*, separately visible and retriable in the Prefect UI.
+
+```python {title="prefect_nested_agent.py" test="skip" lint="skip"}
+@toolset.tool(metadata={'nested_agent_run': True})
+async def delegate_to_specialist(ctx: RunContext[Deps], task: str) -> str:
+    result = await specialist_agent.run(task, deps=ctx.deps)
+    return result.output
+```
+
+For this to work:
+
+- The sub-agent (`specialist_agent` above) should carry its own [`PrefectDurability`][pydantic_ai.durable_exec.prefect.PrefectDurability] capability, bound at agent-construction time — otherwise its own model requests aren't wrapped as Prefect tasks.
+- The tool's toolset needs a unique [`id`][pydantic_ai.toolsets.AbstractToolset.id] (the same requirement as any leaf toolset under Prefect, see [Agent Requirements](#agent-requirements) below).
+- The tool must be `async` (its body becomes a flow run; Prefect runs non-async tools in a thread, which isn't supported as a flow body).
+
+`nested_agent_run` picks Prefect's default subflow config. For control over `retries`, `timeout_seconds`, or other options, set `metadata={'prefect_subflow': FlowConfig(...)}` explicitly instead — it takes precedence over a `nested_agent_run` hint on the same tool. This split matters for toolset authors: a toolset that isn't Prefect-specific (like a sub-agent/delegation toolset meant to work under any durability engine, or none) should only ever set `nested_agent_run`, leaving the Prefect-specific decision to whoever configures that particular agent's durability — the same tag [Temporal's `TemporalDurability`](temporal.md#nested-agent-runs) and [DBOS's `DBOSDurability`](dbos.md#nested-agent-runs) read to make their own engine-specific choice.
+
 ### Streaming
 
 When running inside a Prefect flow, [`Agent.run_stream()`][pydantic_ai.agent.Agent.run_stream] works but doesn't provide real-time streaming because Prefect tasks consume their entire execution before returning results. The method will execute fully and return the complete result at once.

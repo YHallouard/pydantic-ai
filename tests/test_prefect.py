@@ -2365,3 +2365,160 @@ async def test_prefect_durability_continuation_resume_from_history() -> None:
     assert result.usage.output_tokens == 6
     # The continuation request ran inside the boundary — the seed wasn't re-generated.
     assert model.request_calls == 1
+
+# ==========================================
+# Nested agent runs (tools tagged 'nested_agent_run'/'prefect_subflow')
+# ==========================================
+
+
+def test_resolve_tool_flow_config_precedence() -> None:
+    """`resolve_tool_flow_config` precedence: explicit `prefect_subflow` wins over the generic
+    `nested_agent_run` hint; neither key means no subflow; an invalid value raises clearly."""
+    from pydantic_ai.durable_exec.prefect._toolset import resolve_tool_flow_config
+    from pydantic_ai.tools import ToolDefinition
+    from pydantic_ai.toolsets import ToolsetTool
+
+    fn_toolset = FunctionToolset[None](id='resolve_flow_toolset')
+
+    def make_tool(metadata: dict[str, object] | None) -> ToolsetTool[None]:
+        return ToolsetTool[None](
+            toolset=fn_toolset,
+            tool_def=ToolDefinition(name='fn_tool', metadata=metadata),
+            max_retries=0,
+            args_validator=None,  # pyright: ignore[reportArgumentType]
+        )
+
+    assert resolve_tool_flow_config(None, 'x') is None
+    assert resolve_tool_flow_config(make_tool(None), 'x') is None
+    assert resolve_tool_flow_config(make_tool({}), 'x') is None
+    assert resolve_tool_flow_config(make_tool({'nested_agent_run': True}), 'x') == {}
+    assert resolve_tool_flow_config(make_tool({'prefect_subflow': True}), 'x') == {}
+    assert resolve_tool_flow_config(make_tool({'prefect_subflow': {'timeout_seconds': 30.0}}), 'x') == {
+        'timeout_seconds': 30.0
+    }
+    # Explicit override wins over the generic hint, even when both are set.
+    assert resolve_tool_flow_config(
+        make_tool({'nested_agent_run': True, 'prefect_subflow': {'timeout_seconds': 5.0}}), 'x'
+    ) == {'timeout_seconds': 5.0}
+    with pytest.raises(UserError, match="Tool 'x' has invalid 'prefect_subflow' metadata"):
+        resolve_tool_flow_config(make_tool({'prefect_subflow': 'nonsense'}), 'x')
+
+
+async def test_sync_tool_tagged_prefect_subflow_raises_clear_error() -> None:
+    """A sync tool tagged `nested_agent_run` can't run as a Prefect subflow (Prefect runs
+    non-async tools in a thread, not supported as a flow body)."""
+
+    def sync_delegate(ctx: RunContext[None], task: str) -> str:  # pragma: no cover - errors before running
+        return task
+
+    toolset = FunctionToolset(id='sync_delegate_ts')
+    toolset.add_function(sync_delegate, name='sync_delegate', metadata={'nested_agent_run': True})
+
+    def call_model(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('sync_delegate', {'task': 'go'}, tool_call_id='call-1')])
+
+    agent = Agent(
+        FunctionModel(call_model),
+        name='durability_sync_tagged',
+        toolsets=[toolset],
+        capabilities=[PrefectDurability()],
+    )
+
+    @flow
+    async def run_it() -> str:
+        result = await agent.run('go')
+        return result.output
+
+    with flow_raises(
+        UserError,
+        "Tool 'sync_delegate' is tagged to run as a Prefect subflow, but non-async tools run in "
+        'threads which are not supported as a flow body; make the tool function async instead.',
+    ):
+        await run_it()
+
+
+async def test_prefect_durability_nested_agent_run_gets_its_own_subflow() -> None:
+    """A tool tagged `nested_agent_run` that calls another agent's `run()` gets its own Prefect
+    subflow, instead of a plain task that would checkpoint the whole nested run as one opaque unit."""
+
+    def specialist_model_fn(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart('specialist answer')])
+
+    specialist_agent = Agent(
+        FunctionModel(specialist_model_fn), name='nested_specialist', capabilities=[PrefectDurability()]
+    )
+
+    toolset = FunctionToolset(id='nested_delegate_ts')
+
+    async def delegate(ctx: RunContext[None], task: str) -> str:
+        result = await specialist_agent.run(task)
+        return result.output
+
+    toolset.add_function(delegate, name='delegate', metadata={'nested_agent_run': True})
+
+    call_count = {'n': 0}
+
+    def parent_model_fn(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            return ModelResponse(parts=[ToolCallPart('delegate', {'task': 'go'}, tool_call_id='call-1')])
+        return ModelResponse(parts=[TextPart('done')])
+
+    parent_agent = Agent(
+        FunctionModel(parent_model_fn),
+        name='nested_parent',
+        toolsets=[toolset],
+        capabilities=[PrefectDurability()],
+    )
+
+    @flow
+    async def run_parent() -> str:
+        result = await parent_agent.run('hello')
+        return result.output
+
+    output = await run_parent()
+    assert output == 'done'
+
+    from prefect.client.orchestration import get_client
+
+    # Prefect flow runs get randomly-generated names; the underlying *flow* (registered by the
+    # `@flow(name=...)` decoration) keeps the stable name -- match on that to confirm a distinct
+    # 'Delegate: delegate' flow (not just a task) actually ran, separate from 'nested_parent Run'.
+    async with get_client() as client:
+        flows = await client.read_flows()
+        delegate_flow_ids = {f.id for f in flows if f.name == 'Delegate: delegate'}
+        assert delegate_flow_ids, 'expected a registered flow named "Delegate: delegate"'
+        flow_runs = await client.read_flow_runs()
+        assert any(fr.flow_id in delegate_flow_ids and fr.state and fr.state.is_completed() for fr in flow_runs)
+
+
+async def test_prefect_durability_nested_agent_run_failure_surfaces_as_tool_failure() -> None:
+    """A failure inside a tagged tool's own subflow surfaces as a normal tool failure at the
+    caller, not a hang -- unlike Temporal, Prefect doesn't need a special carve-out for this
+    (exceptions propagate through `await subflow_fn(...)` like any other async call); this test
+    pins that Prefect doesn't need the equivalent fix."""
+
+    toolset = FunctionToolset(id='boom_ts')
+
+    async def boom(ctx: RunContext[None], task: str) -> str:
+        raise RuntimeError('boom')
+
+    toolset.add_function(boom, name='boom', metadata={'nested_agent_run': True})
+
+    def parent_model_fn(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('boom', {'task': 'go'}, tool_call_id='call-1')])
+
+    parent_agent = Agent(
+        FunctionModel(parent_model_fn),
+        name='nested_boom_parent',
+        toolsets=[toolset],
+        capabilities=[PrefectDurability()],
+    )
+
+    @flow
+    async def run_parent() -> str:
+        result = await parent_agent.run('hello')
+        return result.output
+
+    with flow_raises(RuntimeError, 'boom'):
+        await run_parent()
