@@ -6054,6 +6054,55 @@ def test_resolve_tool_activity_config_reads_metadata():
         resolve_tool_activity_config(tool, 'fn_tool', {})
 
 
+def test_resolve_tool_child_workflow_config_precedence():
+    """`'nested_agent_run'` is the engine-neutral hint a toolset author sets on their own tool
+    (e.g. a delegation tool that internally calls `agent.run()`) -- it carries no Temporal-specific
+    decision, just the fact "this tool nests an agent run". `TemporalDurability` is the one that
+    turns that fact into "default to a child workflow", here, not the toolset. An explicit
+    `'temporal_child_workflow'` or `'temporal'` always overrides the bare hint.
+    """
+    from pydantic_ai.tools import ToolDefinition
+    from pydantic_ai.toolsets import ToolsetTool
+    from pydantic_ai_slim.pydantic_ai.durable_exec.temporal._toolset import (
+        ChildWorkflowConfig,
+        resolve_tool_child_workflow_config,
+    )
+
+    fn_toolset = FunctionToolset[None](id='resolve_child_wf_toolset')
+    tool_def = ToolDefinition(name='fn_tool', metadata={})
+    tool = ToolsetTool[None](
+        toolset=fn_toolset,
+        tool_def=tool_def,
+        max_retries=0,
+        args_validator=None,  # pyright: ignore[reportArgumentType]
+    )
+
+    # No metadata at all -> no child workflow.
+    assert resolve_tool_child_workflow_config(tool, 'fn_tool') is None
+
+    # Bare 'nested_agent_run' hint -> defaults to a plain child workflow.
+    tool.tool_def.metadata = {'nested_agent_run': True}
+    assert resolve_tool_child_workflow_config(tool, 'fn_tool') == ChildWorkflowConfig()
+
+    # An explicit 'temporal_child_workflow' config wins over the hint.
+    explicit_config = ChildWorkflowConfig(execution_timeout=timedelta(minutes=10))
+    tool.tool_def.metadata = {'nested_agent_run': True, 'temporal_child_workflow': explicit_config}
+    assert resolve_tool_child_workflow_config(tool, 'fn_tool') is explicit_config
+
+    # An explicit 'temporal' (even `False`, the inline-in-parent path) suppresses the hint entirely.
+    tool.tool_def.metadata = {'nested_agent_run': True, 'temporal': False}
+    assert resolve_tool_child_workflow_config(tool, 'fn_tool') is None
+
+    # Both explicit keys together is still a conflict, hint or not.
+    tool.tool_def.metadata = {
+        'nested_agent_run': True,
+        'temporal': {},
+        'temporal_child_workflow': True,
+    }
+    with pytest.raises(UserError, match=r"Tool 'fn_tool' has both 'temporal' and 'temporal_child_workflow'"):
+        resolve_tool_child_workflow_config(tool, 'fn_tool')
+
+
 def test_resolve_tool_activity_config_routes_env_bound_tool_to_leased_queue():
     """An env_bound tool with a lease in ctx.metadata['durable_env'] is routed to the leased queue."""
     from pydantic_ai.tools import ToolDefinition

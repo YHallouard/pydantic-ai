@@ -263,24 +263,39 @@ def resolve_tool_child_workflow_config(
     tool: ToolsetTool[Any] | None,
     tool_name: str,
 ) -> ChildWorkflowConfig | None:
-    """Resolve the per-tool child-workflow config, or `None` when the tool isn't tagged.
+    """Resolve the per-tool child-workflow config, or `None` when the tool doesn't get one.
 
-    Reads `tool.tool_def.metadata['temporal_child_workflow']` (`True` or a
-    [`ChildWorkflowConfig`][pydantic_ai.durable_exec.temporal.ChildWorkflowConfig] dict). A tool
-    tagged this way executes as a *child workflow* instead of an activity: its function body runs
-    as workflow code in [`ToolCallWorkflow`][pydantic_ai.durable_exec.temporal.ToolCallWorkflow],
-    so any I/O it performs (including a nested `agent.run()` on an agent carrying its own
-    `TemporalDurability`) becomes activities of the child, keeping the parent workflow's history
-    flat. Mutually exclusive with the `'temporal'` metadata key: the tool body is workflow code,
-    so there is no activity to configure.
+    Two metadata keys feed this, in order of precedence:
+
+    1. `'temporal_child_workflow'` (`True` or a
+       [`ChildWorkflowConfig`][pydantic_ai.durable_exec.temporal.ChildWorkflowConfig] dict) —
+       explicit, Temporal-specific opt-in, normally set by whoever configures a *specific* agent's
+       durability (timeouts, task queue, etc. are deployment concerns), not by the toolset author.
+    2. `'nested_agent_run'` (`True`) — an engine-neutral fact a toolset author declares about their
+       *own* tool: "this tool's body runs another agent (`agent.run()`)". Set by the tool's author
+       (e.g. a delegation/sub-agent toolset), who has no reason to know or care which durability
+       engine, if any, wraps the outer agent. `TemporalDurability` treats this as "default to a
+       child workflow" -- the natural Temporal-specific consequence of that fact, decided *here*,
+       not by the toolset. A future DBOS/Prefect durability capability is free to interpret the
+       same tag differently (or not need to at all).
+
+    Both keys are mutually exclusive with `'temporal'` (activity config): the tool body becomes
+    workflow code either way, so there is no activity left to configure. An explicit
+    `'temporal_child_workflow'` always wins over a `'nested_agent_run'` hint (e.g. to give it a
+    longer `execution_timeout`), and an explicit `'temporal'` (an `ActivityConfig` dict, or `False`
+    for the inline-in-parent path documented under "Nested Agent Runs") always suppresses the
+    automatic child-workflow default a bare `'nested_agent_run'` hint would otherwise produce.
     """
     metadata = tool.tool_def.metadata if tool is not None else None
     if metadata is None:
         return None
+    activity_config = metadata.get('temporal')
     child_config = metadata.get('temporal_child_workflow')
     if child_config is None:
+        if activity_config is None and metadata.get('nested_agent_run'):
+            return ChildWorkflowConfig()
         return None
-    if metadata.get('temporal') is not None:
+    if activity_config is not None:
         raise UserError(
             f"Tool {tool_name!r} has both 'temporal' and 'temporal_child_workflow' metadata; "
             'a tool runs either as an activity or as a child workflow, not both.'
