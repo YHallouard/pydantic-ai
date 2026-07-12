@@ -26,7 +26,8 @@ from ._agent import TemporalAgent  # pyright: ignore[reportDeprecated]
 from ._durability import TemporalDurability
 from ._logfire import LogfirePlugin
 from ._run_context import TemporalRunContext
-from ._toolset import DurableEnvironmentLease, TemporalWrapperToolset
+from ._tool_call_workflow import ToolCallWorkflow, register_tool_call_target
+from ._toolset import ChildWorkflowConfig, DurableEnvironmentLease, TemporalWrapperToolset
 from ._workflow import PydanticAIWorkflow
 
 __all__ = [
@@ -39,6 +40,9 @@ __all__ = [
     'TemporalWrapperToolset',
     'PydanticAIWorkflow',
     'DurableEnvironmentLease',
+    'ChildWorkflowConfig',
+    'ToolCallWorkflow',
+    'register_tool_call_target',
 ]
 
 # We need eagerly import the anyio backends or it will happens inside workflow code and temporal has issues
@@ -131,6 +135,37 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
     )
 
 
+def _collect_agent_worker_config(
+    agent: AbstractAgent[Any, Any],
+    durability: TemporalDurability[Any],
+    activities: list[Any],
+) -> None:
+    """Fold one agent's durable-execution surface into a worker's registration lists.
+
+    Beyond the durability's own activities, this walks the agent's capability chain for any other
+    capability exposing a `temporal_activities` sequence (structural, not a base-class method) and
+    folds those in too -- the seam a capability that composes *other* durable agents (e.g. a
+    sub-agents capability whose delegate tool runs their `agent.run()` in a child workflow) uses
+    to get their activities registered without the user listing anything by hand. Also registers
+    the agent as a `ToolCallWorkflow` target so tools tagged
+    `metadata={'temporal_child_workflow': ...}` can be resolved from inside that child workflow.
+    """
+    activities.extend(durability.temporal_activities)
+    register_tool_call_target(durability)
+
+    def _fold_capability_activities(cap: Any) -> None:
+        if isinstance(cap, TemporalDurability):
+            return  # already collected above; a capability chain holds the bound copy
+        extra = getattr(cap, 'temporal_activities', None)
+        if extra is None:
+            return
+        for act in extra:
+            if act not in activities:
+                activities.append(act)
+
+    agent.root_capability.apply(_fold_capability_activities)
+
+
 class PydanticAIPlugin(SimplePlugin):
     """Temporal client and worker plugin for Pydantic AI."""
 
@@ -152,6 +187,7 @@ class PydanticAIPlugin(SimplePlugin):
 
         workflows = list(config.get('workflows', []))  # type: ignore[reportUnknownMemberType]
         activities = list(config.get('activities', []))  # type: ignore[reportUnknownMemberType]
+        durable_agents_found = False
 
         for workflow_class in workflows:
             agents = getattr(workflow_class, '__pydantic_ai_agents__', None)
@@ -175,12 +211,19 @@ class PydanticAIPlugin(SimplePlugin):
                             '`TemporalDurability` capability; either add one to `capabilities=[...]` '
                             'or wrap the agent with `TemporalAgent` instead.'
                         )
-                    activities.extend(durability.temporal_activities)  # type: ignore[reportUnknownMemberType]
+                    _collect_agent_worker_config(agent, durability, activities)  # type: ignore[reportUnknownArgumentType]
+                    durable_agents_found = True
                 else:
                     raise TypeError(  # pragma: no cover
                         f'__pydantic_ai_agents__ items must be TemporalAgent or AbstractAgent, got {type(agent)}'  # type: ignore[reportUnknownVariableType]
                     )
 
+        # Workflow registration is the plugin's job, not the user's: any durable agent may carry
+        # tools tagged `temporal_child_workflow`, which start `ToolCallWorkflow` children on this
+        # same worker. Registering it is harmless when unused.
+        if durable_agents_found and ToolCallWorkflow not in workflows:
+            workflows.append(ToolCallWorkflow)
+        config['workflows'] = workflows
         config['activities'] = activities
 
         return config
@@ -197,8 +240,10 @@ class AgentPlugin(SimplePlugin):
     """
 
     def __init__(self, agent: AbstractAgent[Any, Any]):
+        self._durable_agent = False
+        activities: list[Any] = []
         if isinstance(agent, TemporalAgent):  # pyright: ignore[reportDeprecated]
-            activities = agent.temporal_activities
+            activities.extend(agent.temporal_activities)
         else:
             durability = TemporalDurability.from_agent(agent)
             if durability is None:
@@ -206,8 +251,21 @@ class AgentPlugin(SimplePlugin):
                     f'Agent {agent.name!r} has no `TemporalDurability` capability; '
                     'add one to `capabilities=[...]` before constructing the plugin.'
                 )
-            activities = durability.temporal_activities
+            activities = []
+            _collect_agent_worker_config(agent, durability, activities)
+            self._durable_agent = True
         super().__init__(  # type: ignore[reportUnknownMemberType]
             name='AgentPlugin',
             activities=activities,
         )
+
+    def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
+        config = super().configure_worker(config)
+        if self._durable_agent:
+            # Same rationale as `PydanticAIPlugin.configure_worker`: registering the generic
+            # tool-call child workflow is the plugin's job, and harmless when unused.
+            workflows = list(config.get('workflows', []))  # type: ignore[reportUnknownMemberType]
+            if ToolCallWorkflow not in workflows:
+                workflows.append(ToolCallWorkflow)
+            config['workflows'] = workflows
+        return config
