@@ -202,16 +202,33 @@ If you need one or more of these attributes to be available inside activities, y
 
 ### Nested Agent Runs
 
-A tool that calls [`Agent.run()`][pydantic_ai.agent.Agent.run] on another agent (a sub-agent, or "delegation" pattern) needs `metadata={'temporal': False}` on that tool. Without it, the entire nested run — every one of its own model requests and tool calls — collapses into a single activity: no per-call retries, no durability for anything the sub-agent does, and a nested `Agent.run_stream()`/`iter()` call would be just as unsupported as it is for the [outer agent](#streaming).
+A tool that calls [`Agent.run()`][pydantic_ai.agent.Agent.run] on another agent (a sub-agent, or "delegation" pattern) should not run as a regular activity: the entire nested run — every one of its own model requests and tool calls — would collapse into a single activity, with no per-call retries and no durability for anything the sub-agent does.
+
+The recommended approach is to tag the tool with `metadata={'nested_agent_run': True}`, declaring the engine-neutral fact that its body runs another agent. Under Temporal, this makes the tool run as a **child workflow**: the tool's body executes as workflow code, so the sub-agent's own model and tool calls become first-class activities *of the child*. The parent workflow's history only records the child workflow itself — a delegation-heavy agent no longer burns through the parent's [history limit](#long-running-agents).
 
 ```python {title="temporal_nested_agent.py" test="skip" lint="skip"}
-@toolset.tool(metadata={'temporal': False})
+@toolset.tool(metadata={'nested_agent_run': True})
 async def delegate_to_specialist(ctx: RunContext[Deps], task: str) -> str:
     result = await specialist_agent.run(task, deps=ctx.deps)
     return result.output
 ```
 
-With `metadata={'temporal': False}`, the sub-agent's own model/tool calls become first-class Temporal activities again — but every one of its events still lands in the *parent* workflow's history, so a delegation-heavy agent reaches the [history limit](#long-running-agents) faster than one that doesn't delegate. This is a simple, correct default for occasional delegation; an agent that nests sub-agent runs heavily should keep this in mind when tuning `continue_as_new_min_requests`.
+For this to work:
+
+- The sub-agent (`specialist_agent` above) must carry its own [`TemporalDurability`][pydantic_ai.durable_exec.temporal.TemporalDurability] capability, bound at worker setup — its activities must be registered on the worker (e.g. with an extra `AgentPlugin(specialist_agent)`) alongside the parent's.
+- The generic [`ToolCallWorkflow`][pydantic_ai.durable_exec.temporal.ToolCallWorkflow] that executes the tool is registered on the worker automatically by [`PydanticAIPlugin`][pydantic_ai.durable_exec.temporal.PydanticAIPlugin] / [`AgentPlugin`][pydantic_ai.durable_exec.temporal.AgentPlugin]; there is nothing to add to `Worker(workflows=[...])`.
+- The tool must be `async` (its body is workflow code), and its arguments and the agent's dependencies must be serializable — the same constraint as activity-backed tools.
+
+`nested_agent_run` picks Temporal's default child-workflow config. For control over `execution_timeout`, `parent_close_policy` (defaults to `REQUEST_CANCEL`, so cancelling the parent cancels in-flight children), or other options, set `metadata={'temporal_child_workflow': ChildWorkflowConfig(...)}` explicitly instead — it takes precedence over a `nested_agent_run` hint on the same tool. This split matters for toolset authors: a toolset that isn't Temporal-specific (like a sub-agent/delegation toolset meant to work under any durability engine, or none) should only ever set `nested_agent_run`, leaving the Temporal-specific decision to whoever configures that particular agent's durability.
+
+The child workflow's id derives from the parent's workflow id and the tool call id, so a replay of the parent re-attaches to the same child instead of starting a second one.
+
+!!! note "Limitations"
+    - [Continue-as-new](#long-running-agents) is not supported *inside* the child: don't enable `continue_as_new` on a sub-agent delegated this way; bound its runs with [usage limits](../agent.md#usage-limits) instead.
+    - A [`RunUsage`][pydantic_ai.usage.RunUsage] object shared with the nested run (`usage=...`) is not mutated across the workflow boundary — per-child `usage_limits` work, but parent-side aggregation through a shared object does not (this is already the case for activity-backed delegation).
+    - No event streaming crosses the workflow boundary; set an `event_stream_handler` on the sub-agent itself to observe its events (see [Streaming](#streaming)).
+
+As an alternative for occasional, short delegation, `metadata={'temporal': False}` runs the tool inline in the *parent* workflow: the sub-agent's calls become first-class activities again, but every one of its events lands in the parent's history, so heavy delegation reaches the history limit faster — keep that in mind when tuning `continue_as_new_min_requests`.
 
 ### Streaming
 

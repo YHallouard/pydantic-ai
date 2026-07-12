@@ -126,6 +126,7 @@ try:
         PydanticAIWorkflow,
         TemporalAgent,
         TemporalDurability,
+        ToolCallWorkflow,
     )
     from pydantic_ai.durable_exec.temporal._durability import _heartbeating  # pyright: ignore[reportPrivateUsage]
     from pydantic_ai.durable_exec.temporal._function_toolset import TemporalFunctionToolset
@@ -8411,3 +8412,229 @@ async def test_continue_as_new_without_continue_args_raises_clear_error(client: 
                     id='test_continue_as_new_without_continue_args_raises_clear_error',
                     task_queue=TASK_QUEUE,
                 )
+
+
+# --- Tools as child workflows ---
+
+
+def _child_wf_nested_model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(content='nested result')])
+
+
+_child_wf_nested_agent = Agent(
+    FunctionModel(_child_wf_nested_model_fn),
+    name='child_wf_nested',
+    capabilities=[TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
+)
+
+_child_wf_toolset = FunctionToolset[None](id='child_wf_tools')
+
+
+@_child_wf_toolset.tool(metadata={'nested_agent_run': True})
+async def run_nested(ctx: RunContext[None], task: str) -> str:
+    result = await _child_wf_nested_agent.run(task)
+    return cast(str, result.output)
+
+
+@_child_wf_toolset.tool(metadata={'nested_agent_run': True})
+async def nested_boom(ctx: RunContext[None]) -> str:
+    raise RuntimeError('boom')
+
+
+@_child_wf_toolset.tool(metadata={'temporal': {}, 'temporal_child_workflow': True})
+async def both_tagged(ctx: RunContext[None]) -> str:
+    return 'unreachable'  # pragma: no cover
+
+
+@_child_wf_toolset.tool(metadata={'nested_agent_run': True})
+def sync_tagged(ctx: RunContext[None]) -> str:
+    return 'unreachable'  # pragma: no cover
+
+
+def _child_wf_parent_model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Calls the tool named in the user prompt once, then answers from its return."""
+    for msg in reversed(messages):
+        for part in msg.parts:
+            if isinstance(part, ToolReturnPart):
+                return ModelResponse(parts=[TextPart(content=f'Done: {part.content}')])
+    prompt = next(part for part in messages[0].parts if isinstance(part, UserPromptPart))
+    assert isinstance(prompt.content, str)
+    args = {'task': 'greet'} if prompt.content == 'run_nested' else {}
+    return ModelResponse(parts=[ToolCallPart(tool_name=prompt.content, args=args)])
+
+
+_child_wf_parent_agent = Agent(
+    FunctionModel(_child_wf_parent_model_fn),
+    name='child_wf_parent',
+    toolsets=[_child_wf_toolset],
+    capabilities=[TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
+)
+
+
+@workflow.defn
+class ChildWorkflowToolWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await _child_wf_parent_agent.run(prompt)
+        return cast(str, result.output)
+
+
+def _child_workflow_ids_initiated(history: WorkflowHistory) -> list[str]:
+    return [
+        event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+        for event in history.events
+        if event.HasField('start_child_workflow_execution_initiated_event_attributes')
+    ]
+
+
+def _scheduled_activity_names(history: WorkflowHistory) -> list[str]:
+    return [
+        event.activity_task_scheduled_event_attributes.activity_type.name
+        for event in history.events
+        if event.HasField('activity_task_scheduled_event_attributes')
+    ]
+
+
+async def test_tool_tagged_child_workflow_runs_as_child_and_keeps_parent_history_flat(client: Client):
+    """A `metadata={'nested_agent_run': True}` tool runs as a child workflow: the nested agent's
+    model-request activity is scheduled by the *child*, not the parent -- the parent's history
+    only contains its own model requests plus the child workflow events, which is the whole point
+    of running a long tool as a child instead of inlining it or collapsing it into one activity.
+    """
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[ChildWorkflowToolWorkflow],
+        plugins=[AgentPlugin(_child_wf_parent_agent), AgentPlugin(_child_wf_nested_agent)],
+    ):
+        wf_id = 'test_tool_tagged_child_workflow'
+        output = await client.execute_workflow(
+            ChildWorkflowToolWorkflow.run,
+            args=['run_nested'],
+            id=wf_id,
+            task_queue=TASK_QUEUE,
+        )
+
+    assert output == 'Done: nested result'
+
+    parent_history = await client.get_workflow_handle(wf_id).fetch_history()
+    child_ids = _child_workflow_ids_initiated(parent_history)
+    assert len(child_ids) == 1
+    # Stable, replay-safe child id: parent workflow id + the tool call id.
+    assert child_ids[0].startswith(f'{wf_id}--')
+
+    parent_activities = _scheduled_activity_names(parent_history)
+    assert parent_activities.count('agent__child_wf_parent__model_request') == 2
+    assert not any('child_wf_nested' in name for name in parent_activities)
+
+    child_history = await client.get_workflow_handle(child_ids[0]).fetch_history()
+    child_activities = _scheduled_activity_names(child_history)
+    assert child_activities == ['agent__child_wf_nested__model_request']
+
+
+async def test_tool_child_workflow_failure_surfaces_as_tool_failure(client: Client):
+    """A tool body raising inside the child workflow fails the parent's tool call (and here the
+    run), instead of hanging the child or silently succeeding -- the parent stays in charge of
+    error handling exactly like it would for an activity-backed tool.
+    """
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[ChildWorkflowToolWorkflow],
+        plugins=[AgentPlugin(_child_wf_parent_agent), AgentPlugin(_child_wf_nested_agent)],
+    ):
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await client.execute_workflow(
+                ChildWorkflowToolWorkflow.run,
+                args=['nested_boom'],
+                id='test_tool_child_workflow_failure',
+                task_queue=TASK_QUEUE,
+            )
+
+    causes: list[str] = []
+    cause: BaseException | None = exc_info.value.__cause__
+    while cause is not None:
+        causes.append(str(cause))
+        cause = cause.__cause__
+    assert any('boom' in message for message in causes)
+
+
+async def test_tool_tagged_both_activity_and_child_workflow_raises_clear_error(client: Client):
+    """The `'temporal'` and `'temporal_child_workflow'` metadata keys are mutually exclusive: a
+    tool runs either as an activity or as a child workflow, and asking for both is a config error
+    surfaced immediately rather than one key silently winning.
+    """
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[ChildWorkflowToolWorkflow],
+        plugins=[AgentPlugin(_child_wf_parent_agent), AgentPlugin(_child_wf_nested_agent)],
+    ):
+        with workflow_raises(
+            UserError,
+            "Tool 'both_tagged' has both 'temporal' and 'temporal_child_workflow' metadata; "
+            'a tool runs either as an activity or as a child workflow, not both.',
+        ):
+            await client.execute_workflow(
+                ChildWorkflowToolWorkflow.run,
+                args=['both_tagged'],
+                id='test_tool_tagged_both_raises',
+                task_queue=TASK_QUEUE,
+            )
+
+
+async def test_sync_tool_tagged_child_workflow_raises_clear_error(client: Client):
+    """A sync tool can't run as workflow code (it would need a thread), same constraint as
+    `metadata={'temporal': False}` -- surfaced as a clear config error."""
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[ChildWorkflowToolWorkflow],
+        plugins=[AgentPlugin(_child_wf_parent_agent), AgentPlugin(_child_wf_nested_agent)],
+    ):
+        with workflow_raises(
+            UserError,
+            "Tool 'sync_tagged' is configured to run as a child workflow, but non-async tools are run in "
+            'threads which are not supported in workflow code. Make the tool function async instead.',
+        ):
+            await client.execute_workflow(
+                ChildWorkflowToolWorkflow.run,
+                args=['sync_tagged'],
+                id='test_sync_tool_tagged_raises',
+                task_queue=TASK_QUEUE,
+            )
+
+
+async def test_agent_plugin_registers_tool_call_workflow_and_capability_activities():
+    """Unit test of the worker-registration surface (no server needed, and a live workflow test
+    couldn't observe it directly): `AgentPlugin` registers the generic `ToolCallWorkflow` and
+    folds in activities contributed by non-durability capabilities via the structural
+    `temporal_activities` seam -- what a capability composing other durable agents (e.g.
+    sub-agents) relies on to get their activities registered without user wiring.
+    """
+
+    async def extra_activity() -> None:  # pragma: no cover -- only registration is asserted
+        pass
+
+    class ExtraActivitiesCapability(AbstractCapability[Any]):
+        @property
+        def temporal_activities(self) -> list[Any]:
+            return [extra_activity]
+
+    agent = Agent(
+        FunctionModel(_child_wf_nested_model_fn),
+        name='cap_seam_agent',
+        capabilities=[ExtraActivitiesCapability(), TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
+    )
+    plugin = AgentPlugin(agent)
+    config = plugin.configure_worker({'task_queue': TASK_QUEUE})
+
+    workflows = list(config.get('workflows', []))
+    assert ToolCallWorkflow in workflows
+    activities = list(config.get('activities', []))
+    assert extra_activity in activities
+    # The durability's own activities are collected once, not duplicated by the capability walk.
+    durability = TemporalDurability.from_agent(agent)
+    assert durability is not None
+    for act in durability.temporal_activities:
+        assert activities.count(act) == 1
