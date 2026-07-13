@@ -70,6 +70,19 @@ class ToolCallWorkflow:
     `PydanticAIPlugin`/`AgentPlugin`. One module-level class shared by all agents: a class created
     dynamically per agent would not survive the workflow sandbox's re-import of its defining
     module.
+
+    Known limitation: a tool body's own nested `agent.run()` (e.g. a sub-agent delegation) does
+    not support continue-as-new. `run()` below calls `call_tool_in_workflow` directly, not through
+    `PydanticAIWorkflow.run_agent()` -- the only place that catches
+    [`AgentRunPaused`][pydantic_ai.exceptions.AgentRunPaused] and calls `workflow.continue_as_new`.
+    If a nested run's own `TemporalDurability(continue_as_new='auto')` (the default) triggers a
+    pause once its own history/request count grows enough, `AgentRunPaused` propagates uncaught
+    from the tool body and -- per `failure_exception_types=[Exception]` above -- genuinely fails
+    this child workflow instead of continuing it gracefully. Fixing this needs `ToolCallWorkflow`
+    to continue-as-new itself, which means threading an `AgentCarryOver` for the *nested* run
+    through `ToolCallWorkflowParams` (or `ctx.metadata`) and back into the tool body's next
+    `agent.run()` call -- not yet implemented. Work around it today by setting
+    `continue_as_new=False` on any nested agent's `TemporalDurability`.
     """
 
     @workflow.run

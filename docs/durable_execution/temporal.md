@@ -224,7 +224,7 @@ For this to work:
 The child workflow's id derives from the parent's workflow id and the tool call id, so a replay of the parent re-attaches to the same child instead of starting a second one.
 
 !!! note "Limitations"
-    - [Continue-as-new](#long-running-agents) is not supported *inside* the child: don't enable `continue_as_new` on a sub-agent delegated this way; bound its runs with [usage limits](../agent.md#usage-limits) instead.
+    - [Continue-as-new](#long-running-agents) is not supported *inside* the child: the tool body's nested `agent.run()` isn't called through [`run_agent()`][pydantic_ai.durable_exec.temporal.PydanticAIWorkflow.run_agent], so nothing catches the sub-agent's own `AgentRunPaused` -- it propagates uncaught and genuinely fails the child workflow (see [`ToolCallWorkflow`][pydantic_ai.durable_exec.temporal.ToolCallWorkflow]'s docstring). Don't enable `continue_as_new` on a sub-agent delegated this way; bound its runs with [usage limits](../agent.md#usage-limits) instead.
     - A [`RunUsage`][pydantic_ai.usage.RunUsage] object shared with the nested run (`usage=...`) is not mutated across the workflow boundary — per-child `usage_limits` work, but parent-side aggregation through a shared object does not (this is already the case for activity-backed delegation).
     - No event streaming crosses the workflow boundary; set an `event_stream_handler` on the sub-agent itself to observe its events (see [Streaming](#streaming)).
 
