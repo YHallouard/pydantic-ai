@@ -29,7 +29,10 @@ from pydantic_ai.capabilities.abstract import (
 )
 from pydantic_ai.durable_exec import AgentCarryOver
 from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._runtime_toolsets import reject_unsupported_runtime_toolsets
+from pydantic_ai.durable_exec._runtime_toolsets import (
+    _runtime_toolset_kind,
+    reject_unsupported_runtime_toolsets,
+)
 from pydantic_ai.durable_exec._utils import (
     DurableModel,
     StreamedActivityResult,
@@ -756,6 +759,11 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
         the deprecated `TemporalAgent` does. Non-executing toolsets like `ExternalToolset`
         pass through. Only applies inside a workflow; outside one the capability is
         transparent and any toolset is fine.
+
+        Leaves are classified in place (no second `apply`). A per-run capability merge
+        rebuilds `CapabilityOwnedToolset` wrappers around the same construction-time
+        function leaves; re-applying into those wrappers would false-positive on the
+        already-registered inner `FunctionToolset`.
         """
         if not workflow.in_workflow():
             return
@@ -772,8 +780,14 @@ class TemporalDurability(BaseDurabilityCapability[AgentDepsT]):
                 runtime_leaves.append(leaf)
 
         toolset.apply(collect)
+        # Only the leaf itself counts: `CapabilityOwnedToolset.apply` also visits its
+        # wrapped construction-time FunctionToolset, which would false-positive if we
+        # fed wrappers into `reject_unsupported_runtime_toolsets` (it re-applies).
+        unsupported_kinds = frozenset({'function', 'mcp', 'dynamic'})
         reject_unsupported_runtime_toolsets(
-            runtime_leaves, unsupported_kinds=frozenset({'function', 'mcp', 'dynamic'}), engine='Temporal'
+            [leaf for leaf in runtime_leaves if _runtime_toolset_kind(leaf) in unsupported_kinds],
+            unsupported_kinds=unsupported_kinds,
+            engine='Temporal',
         )
 
     def get_ordering(self) -> CapabilityOrdering:
