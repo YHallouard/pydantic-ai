@@ -8,10 +8,11 @@ except ImportError as _import_error:
         'you can use the `temporal` optional group — `pip install "pydantic-ai-slim[temporal]"`'
     ) from _import_error
 
+import inspect
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from pydantic.errors import PydanticUserError
 from temporalio.contrib.pydantic import PydanticPayloadConverter
@@ -27,6 +28,7 @@ from ...exceptions import AgentRunError, UserError
 from ._agent import TemporalAgent  # pyright: ignore[reportDeprecated]
 from ._durability import TemporalDurability
 from ._logfire import LogfirePlugin
+from ._operation_names import TemporalOperationNamer
 from ._payload_converter import PydanticAIPayloadConverter
 from ._run_context import TemporalRunContext
 from ._toolset import TemporalWrapperToolset
@@ -40,6 +42,7 @@ __all__ = [
     'AgentPlugin',
     'TemporalRunContext',
     'TemporalWrapperToolset',
+    'TemporalOperationNamer',
     'PydanticAIWorkflow',
     'PydanticAIPayloadConverter',
 ]
@@ -93,6 +96,7 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             'pydantic_graph',
             'pydantic',
             'pydantic_core',
+            'annotated_types',
             'pydantic_monty',
             'logfire',
             'rich',
@@ -117,6 +121,12 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             # e.g. a `gateway/anthropic:` or `anthropic:` model resolved lazily via `infer_model`.
             # Safe to pass through: a deterministic, read-only config lookup.
             'anthropic',
+            # The OpenAI SDK defers importing its large generated resource tree until a model constructor
+            # accesses `client.chat.completions` or `client.responses`. Without passthrough, Temporal reloads
+            # that tree in every isolated workflow sandbox. Pass through the whole SDK so resource classes and
+            # their base classes come from one coherent module graph. Pydantic AI does not use the SDK's global
+            # client configuration: it creates per-model clients and invokes their request methods in activities.
+            'openai',
             # The `google-genai` SDK lazily imports `google.auth` submodules (e.g.
             # `google.auth.aio.credentials`) while constructing its client, which Temporal flags as
             # "imported after initial workflow load" when a `gateway/google-cloud:` (or `google-*:`)
@@ -129,12 +139,14 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             # Imported inside `logfire._internal.json_schema` when running `logfire.info` inside an activity with attributes to serialize
             'numpy',
             'pandas',
-            # `response.cost()` lazily imports `genai_prices` (and its `httpx2` dependency) on first call.
-            # When cost is calculated inside a workflow, the sandbox re-imports that chain and `httpx2._models`
-            # subclasses `urllib.request.Request`, which is restricted unless `genai_prices`/`httpx2` are passed
+            # `response.cost()` lazily imports `genai_prices` (and its httpx2 dependencies) on first call.
+            # When cost is calculated or an httpx2-backed model is constructed inside a workflow, the sandbox
+            # re-imports that chain and touches restricted request/lock types unless these modules are passed
             # through alongside the rest of the HTTP stack.
             'genai_prices',
             'httpx2',
+            'httpcore2',
+            'truststore',
         ),
     )
 
@@ -166,8 +178,13 @@ class PydanticAIPlugin(SimplePlugin):
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
         config = super().configure_worker(config)
 
-        workflows = list(config.get('workflows', []))  # type: ignore[reportUnknownMemberType]
-        activities = list(config.get('activities', []))  # type: ignore[reportUnknownMemberType]
+        workflows = list(config.get('workflows', []))  # pyright: ignore[reportUnknownMemberType]
+        activities = list(
+            cast(
+                Sequence[Callable[..., object]],
+                config.get('activities', []),  # pyright: ignore[reportUnknownMemberType]
+            )
+        )
 
         for workflow_class in workflows:
             agents = getattr(workflow_class, '__pydantic_ai_agents__', None)
@@ -182,7 +199,7 @@ class PydanticAIPlugin(SimplePlugin):
                     # Deprecated path: `TemporalAgent` is being phased out in favor of
                     # `capabilities=[TemporalDurability(...)]` on a regular `Agent`. Kept
                     # working so existing workers keep loading without changes.
-                    activities.extend(agent.temporal_activities)  # type: ignore[reportUnknownMemberType]
+                    activities.extend(agent.temporal_activities)
                 elif isinstance(agent, AbstractAgent):
                     durability = TemporalDurability.from_agent(agent)  # type: ignore[reportUnknownArgumentType]
                     if durability is None:
@@ -190,13 +207,19 @@ class PydanticAIPlugin(SimplePlugin):
                             f'Agent {agent.name!r} listed in `__pydantic_ai_agents__` has no '
                             '`TemporalDurability` capability; add one to `capabilities=[...]`.'
                         )
-                    activities.extend(durability.temporal_activities)  # type: ignore[reportUnknownMemberType]
+                    registrations = durability.temporal_registrations
+                    for registration in registrations:
+                        if inspect.isclass(registration):
+                            workflows.append(registration)
+                        else:
+                            activities.append(registration)
                 else:
                     raise TypeError(  # pragma: no cover
                         f'__pydantic_ai_agents__ items must be TemporalAgent or AbstractAgent, got {type(agent)}'  # type: ignore[reportUnknownVariableType]
                     )
 
         config['activities'] = activities
+        config['workflows'] = workflows
 
         return config
 
@@ -212,6 +235,7 @@ class AgentPlugin(SimplePlugin):
     """
 
     def __init__(self, agent: AbstractAgent[Any, Any]):
+        workflows: list[type] = []
         if isinstance(agent, TemporalAgent):  # pyright: ignore[reportDeprecated]
             activities = agent.temporal_activities
         else:
@@ -221,8 +245,11 @@ class AgentPlugin(SimplePlugin):
                     f'Agent {agent.name!r} has no `TemporalDurability` capability; '
                     'add one to `capabilities=[...]` before constructing the plugin.'
                 )
-            activities = durability.temporal_activities
+            registrations = durability.temporal_registrations
+            activities = [r for r in registrations if not inspect.isclass(r)]
+            workflows = [r for r in registrations if inspect.isclass(r)]
         super().__init__(  # type: ignore[reportUnknownMemberType]
             name='AgentPlugin',
             activities=activities,
+            workflows=workflows,
         )
