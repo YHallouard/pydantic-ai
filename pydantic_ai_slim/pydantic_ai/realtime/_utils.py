@@ -11,6 +11,7 @@ from typing import Literal, assert_never, overload
 
 import anyio
 
+from .._framing import SYSTEM_TAG, wrap
 from ..exceptions import UserError
 from ..messages import (
     AudioUrl,
@@ -32,7 +33,6 @@ from ..messages import (
 )
 from ..models import (
     ModelRequestParameters,
-    _wrap_in_system_tags,  # pyright: ignore[reportPrivateUsage]
     download_item,
 )
 from ..models._tool_choice import ResolvedToolChoice, resolve_tool_choice
@@ -58,6 +58,16 @@ def resolve_advertised_tools(
         _, allowed = resolved
         return [tool for tool in tools if tool.name in allowed], resolved
     return tools, resolved
+
+
+class SystemPromptText(str):
+    """`<system>`-tagged text a session delivers for system-prompt parts alone (`enqueue(SystemPromptPart(...))`).
+
+    It goes out as a `str` text turn like any other, so a connection that doesn't look for it delivers it as one; one
+    whose protocol says who wrote what can deliver it as the operator's rather than the user's.
+    """
+
+    __slots__ = ()
 
 
 DEFAULT_MAX_RECONNECTS = 50
@@ -147,7 +157,7 @@ def seed_retry_feedback_text(part: RetryFeedbackPart) -> str:
     model from reading it as something a person said (https://github.com/pydantic/pydantic-ai/issues/6404).
     """
     text = part.model_response()
-    return _wrap_in_system_tags(text) if _retry_feedback_speaks_for_the_harness(part) else text
+    return wrap(SYSTEM_TAG, text) if _retry_feedback_speaks_for_the_harness(part) else text
 
 
 @overload
