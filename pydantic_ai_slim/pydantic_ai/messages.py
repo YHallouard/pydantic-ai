@@ -4,10 +4,8 @@ import base64
 import dataclasses
 import difflib
 import hashlib
-import html
 import mimetypes
 import os
-import re
 import sys
 import warnings
 from abc import ABC, abstractmethod
@@ -59,6 +57,17 @@ from ._event_registry import (
     keeps_canonical_registration as _keeps_canonical_registration,
     shadowed_envelope_fields as _shadowed_envelope_fields,
     undecorated_field_base as _undecorated_field_base,
+)
+from ._framing import (
+    CONTEXT_DIFF_TAG,
+    CONTEXT_TAG,
+    RETRY_FEEDBACK_TAG,
+    TOOL_RESULT_TAG,
+    VALIDATION_ERRORS_TAG,
+    FramingTag,
+    close_tag,
+    open_tag,
+    wrap,
 )
 from ._instrumentation import redact_binary_content, serialize_any
 from ._utils import generate_tool_call_id as _generate_tool_call_id, now_utc as _now_utc
@@ -612,6 +621,8 @@ class TextContent:
     `ModelMessagesTypeAdapter` preserves this field, but as application-only data it is not
     guaranteed to survive a round-trip through the UI adapters; see
     [Storing and loading messages](../message-history.md#storing-and-loading-messages-to-json).
+    [`sanitize_messages`][pydantic_ai.messages.sanitize_messages] drops it from user prompts, since
+    a client that could set it could pass its text off as content the application added.
     """
 
     kind: Literal['text-content'] = 'text-content'
@@ -1281,6 +1292,20 @@ tool_return_ta: pydantic.TypeAdapter[Any] = pydantic.TypeAdapter(
 )
 
 
+def _tool_return_text(value: Any) -> str:
+    """The model-facing text of a non-`str` tool return value: its JSON form, decoded when that form is a JSON string.
+
+    A JSON round trip of the message history turns a value that serializes to a JSON string (`datetime`,
+    `UUID`, `Decimal`, a str-returning serializer, ...) into that plain `str`, which is sent as-is. Sending
+    the decoded string from the start keeps the text the model sees, and the prompt-cache prefix, identical
+    before and after the history is persisted and restored.
+    """
+    dumped = tool_return_ta.dump_json(value, by_alias=True)
+    if dumped.startswith(b'"'):
+        return pydantic_core.from_json(dumped)
+    return dumped.decode()
+
+
 class _StrPassthrough:
     """The `str` arm of `ToolReturnContent`, matched entirely in Rust in both validation modes.
 
@@ -1891,9 +1916,8 @@ def _tool_result_provenance_tags(tool_name: str, tool_call_id: str, file_identif
     that accepts media in its tool result channel sends it there and never renders these at all.
     """
     return (
-        f'<tool_result tool_name="{html.escape(tool_name)}" tool_call_id="{html.escape(tool_call_id)}"'
-        f' file_id="{html.escape(file_identifier)}">',
-        '</tool_result>',
+        open_tag(TOOL_RESULT_TAG, tool_name=tool_name, tool_call_id=tool_call_id, file_id=file_identifier),
+        close_tag(TOOL_RESULT_TAG),
     )
 
 
@@ -2041,7 +2065,8 @@ class BaseToolReturnPart(Generic[ContentT_co]):
         Args:
             mode: Controls serialization of non-file items:
                 - `'raw'`: No serialization. Returns items as-is.
-                - `'str'`: Non-file items are serialized to strings via `tool_return_ta`.
+                - `'str'`: Non-file items are serialized to JSON text via `tool_return_ta`; an item whose
+                  JSON form is a string (e.g. a `datetime`) becomes that string, unquoted.
                   File items (`MultiModalContent`) pass through unchanged.
                 - `'jsonable'`: Non-file items are serialized to JSON-compatible Python objects
                   via `tool_return_ta`. File items pass through unchanged.
@@ -2084,13 +2109,16 @@ class BaseToolReturnPart(Generic[ContentT_co]):
             elif isinstance(item, str):
                 result.append(item)
             elif mode == 'str':
-                result.append(tool_return_ta.dump_json(item, by_alias=True).decode())
+                result.append(_tool_return_text(item))
             else:
                 result.append(tool_return_ta.dump_python(item, mode='json', by_alias=True))
         return result
 
     def model_response_str(self, *, wrap_if_error: bool = True) -> str:
         """Return a string representation of the data content for the model.
+
+        A `str` is returned as-is and `None` as `''`; any other value as its JSON text, and a value
+        whose JSON form is a string (e.g. a `datetime`) as that string, unquoted.
 
         This excludes multimodal files - use `.files` to get those separately.
 
@@ -2105,7 +2133,7 @@ class BaseToolReturnPart(Generic[ContentT_co]):
         elif isinstance(value, str):
             response = value
         else:
-            response = tool_return_ta.dump_json(value, by_alias=True).decode()
+            response = _tool_return_text(value)
 
         if wrap_if_error and self.outcome in ERROR_OUTCOMES:
             return tool_return_ta.dump_json({'error': self._error_value(value, response)}).decode()
@@ -2321,50 +2349,12 @@ class NativeToolReturnPart(BaseToolReturnPart[ContentT_co]):
 error_details_ta = pydantic.TypeAdapter(list[pydantic_core.ErrorDetails], config=pydantic.ConfigDict(defer_build=True))
 
 
-_FeedbackTag: TypeAlias = Literal['system', 'validation_errors', 'retry_feedback']
-
-
-def _user_voice_fence_escape(tag: str) -> re.Pattern[str]:
-    """The `<` of the fence's own closing tag, and of the `<system>` voice tag, opening or closing."""
-    return re.compile(rf'<(?=\s*/\s*{tag}(?=[\s/>]|$)|\s*(?:/\s*)?system(?=[\s/>]|$))', re.IGNORECASE)
-
-
-_TAG_ESCAPES: dict[_FeedbackTag, re.Pattern[str]] = {
-    'system': re.compile(r'<(?=\s*/\s*system(?=[\s/>]|$))', re.IGNORECASE),
-    'validation_errors': _user_voice_fence_escape('validation_errors'),
-    'retry_feedback': _user_voice_fence_escape('retry_feedback'),
-}
-"""Per-tag patterns matching only the `<` of a tag the wrapped text must not be able to write.
-
-That is the wrapping tag's own closing tag, in every spelling a model might reach for, including one
-cut off at the end of the text, and inside the user-voice `<validation_errors>` and `<retry_feedback>`
-fences also the `<system>` voice tag, opening or closing, so text quoted back from the model can't
-pass itself off as the framework speaking.
-
-Compiled once per tag, since `_wrap_in_tag` runs over every mid-conversation system prompt of every
-request on a provider without inline system prompts.
-"""
-
-
 _RETRY_FEEDBACK_FRAMING = "Your previous response failed the application's validation (this is automated feedback, not a message from the user):"
 """The line that opens user-voice retry feedback, ahead of its `<validation_errors>` or `<retry_feedback>` fence.
 
 The feedback goes out in the user voice, so this says who is speaking: the application checking the
 model's output, not the person it is talking to (https://github.com/pydantic/pydantic-ai/issues/6404).
 """
-
-
-def _wrap_in_tag(content: str, *, tag: _FeedbackTag) -> str:
-    """Wrap text in `<tag>…</tag>`, neutralizing any tag the text must not be able to write itself.
-
-    Only the `<` of such a tag is escaped, so the rest of the text goes in exactly as written.
-    Without that, text the model had a hand in — a validation error's `loc` is a key it invented for a
-    mapping output, and a `value_error`'s `msg` is whatever a validator raised, commonly with the
-    offending value interpolated in — could end the statement early and let whatever follows read as
-    if it stood outside it, or, inside a user-voice fence, open a `<system>` block of its own. See
-    `_TAG_ESCAPES` for what each tag neutralizes.
-    """
-    return f'<{tag}>{_TAG_ESCAPES[tag].sub("&lt;", content)}</{tag}>'
 
 
 def _dump_error_details(errors: list[pydantic_core.ErrorDetails]) -> list[dict[str, Any]]:
@@ -2593,7 +2583,7 @@ class RetryFeedbackPart:
         if _retry_feedback_speaks_for_the_harness(self):
             return content
         return _fenced_retry_feedback(
-            content, tag='validation_errors' if self.retry.cause == 'validation_error' else 'retry_feedback'
+            content, tag=VALIDATION_ERRORS_TAG if self.retry.cause == 'validation_error' else RETRY_FEEDBACK_TAG
         )
 
     def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
@@ -2623,9 +2613,15 @@ def _retry_feedback_text(part: RetryFeedbackPart) -> str:
     return tool_return_ta.dump_json(_dump_error_details(part.content), by_alias=True).decode()
 
 
-def _fenced_retry_feedback(content: str, *, tag: _FeedbackTag) -> str:
-    """Feedback in the user voice: the application attribution line, then the content fenced in `tag`."""
-    fence = _wrap_in_tag(f'\n{content}\n', tag=tag)
+def _fenced_retry_feedback(content: str, *, tag: FramingTag) -> str:
+    """Feedback in the user voice: the application attribution line, then the content fenced in `tag`.
+
+    `wrap` neutralizes every framing tag in the content, since it carries the model's own words: a
+    validation error's `loc` is a key it invented for a mapping output, and a `value_error`'s `msg` is
+    whatever a validator raised, commonly with the offending value interpolated in. Without that, the
+    content could end the fence early, or open a `<system>` block of its own.
+    """
+    fence = wrap(tag, f'\n{content}\n')
     return f'{_RETRY_FEEDBACK_FRAMING}\n{fence}'
 
 
@@ -2795,7 +2791,24 @@ class CapabilityInstructionSource:
     __repr__ = _utils.dataclasses_no_defaults_repr
 
 
-InstructionSource: TypeAlias = AgentInstructionSource | ToolsetInstructionSource | CapabilityInstructionSource
+@dataclass(frozen=True, repr=False)
+class RunInstructionSource:
+    """Instructions passed to a run method's `instructions` argument.
+
+    Only a named [`InstructionPart`][pydantic_ai.messages.InstructionPart] is addressed by it, as
+    `'run:<name>'`: a run's instructions belong to whoever starts the run, and the name is what says
+    a value passed to a later run of the same conversation is the same block.
+    """
+
+    def __str__(self) -> str:
+        return 'run'
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+InstructionSource: TypeAlias = (
+    AgentInstructionSource | ToolsetInstructionSource | CapabilityInstructionSource | RunInstructionSource
+)
 """The source that authored an instruction part."""
 
 
@@ -2804,7 +2817,7 @@ class InstructionId:
     """The key an instruction part is addressed by: who contributed it, and which of their parts it is."""
 
     source: InstructionSource
-    """Who contributed the part: the agent, a toolset with an `id`, or a capability with an `id`."""
+    """Who contributed the part: the agent, a toolset with an `id`, a capability with an `id`, or a run."""
 
     _: KW_ONLY
 
@@ -2829,6 +2842,8 @@ def _deserialize_instruction_id(value: str | InstructionId | None) -> Instructio
         return InstructionId(AgentInstructionSource())
     if value.startswith('agent:'):
         return InstructionId(AgentInstructionSource(), name=value.removeprefix('agent:'))
+    if value.startswith('run:'):
+        return InstructionId(RunInstructionSource(), name=value.removeprefix('run:'))
     for namespace, source_type in (
         ('toolset', ToolsetInstructionSource),
         ('capability', CapabilityInstructionSource),
@@ -2916,6 +2931,7 @@ class InstructionPart:
     - [`AgentInstructionSource`][pydantic_ai.messages.AgentInstructionSource] — the agent's literal instructions
     - [`ToolsetInstructionSource`][pydantic_ai.messages.ToolsetInstructionSource] — a toolset with an `id`
     - [`CapabilityInstructionSource`][pydantic_ai.messages.CapabilityInstructionSource] — a capability with an `id`
+    - [`RunInstructionSource`][pydantic_ai.messages.RunInstructionSource] — a named part passed to a run method's `instructions`
 
     An id renders and serializes as its segments joined by `:` — `'agent'`, `'toolset:weather'`, or
     `'capability:budget:remaining'`.
@@ -3009,22 +3025,18 @@ def _instruction_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-_CLOSING_FRAMING_TAG = re.compile(r'</(context_diff|context|system)\s*>', re.IGNORECASE)
-
-
-def _neutralize_closing_tags(content: str) -> str:
-    """Escape closing framing tags in a block's text, so the text can't end its own element early."""
-    return _CLOSING_FRAMING_TAG.sub(lambda match: f'&lt;/{match.group(1)}>', content)
-
-
-def _id_attribute(instruction_id: InstructionId | None) -> str:
-    """The `id` attribute naming a block, or nothing for a change a newer version wrote that this one can't address."""
-    return f' id="{html.escape(str(instruction_id))}"' if instruction_id is not None else ''
-
-
 def _context_element(instruction_id: InstructionId | None, content: str) -> str:
-    """Tag an append-mode block's statement with its id, so a later statement can name the one it replaces."""
-    return f'<context{_id_attribute(instruction_id)}>\n{_neutralize_closing_tags(content)}\n</context>'
+    """Tag an append-mode block's statement with its id, so a later statement can name the one it replaces.
+
+    `wrap` neutralizes every framing tag in the text, including `</system>`: the element is itself
+    `<system>`-wrapped on a model without mid-conversation system messages.
+    """
+    return wrap(CONTEXT_TAG, f'\n{content}\n', id=_id_attribute(instruction_id))
+
+
+def _id_attribute(instruction_id: InstructionId | None) -> str | None:
+    """The `id` attribute naming a block, or `None` for a change a newer version wrote that this one can't address."""
+    return str(instruction_id) if instruction_id is not None else None
 
 
 def _context_diff_element(instruction_id: InstructionId | None, previous: str, content: str) -> str:
@@ -3032,7 +3044,7 @@ def _context_diff_element(instruction_id: InstructionId | None, previous: str, c
     diff = '\n'.join(
         difflib.unified_diff(previous.split('\n'), content.split('\n'), 'before', 'after', lineterm='', n=2)
     )
-    return f'<context_diff{_id_attribute(instruction_id)}>\n{_neutralize_closing_tags(diff)}\n</context_diff>'
+    return wrap(CONTEXT_DIFF_TAG, f'\n{diff}\n', id=_id_attribute(instruction_id))
 
 
 _SUPERSESSION_SENTENCE = (
@@ -3249,6 +3261,130 @@ class ModelRequest:
 
 
 @dataclass(repr=False)
+class WebCitationSource:
+    """A web page a citation points to."""
+
+    url: str
+    """The page's URL."""
+
+    _: KW_ONLY
+
+    title: str | None = None
+    """The page's title, if the provider gave one."""
+
+    excerpts: list[str] = field(default_factory=list[str])
+    """Passages from the source that back the cited text.
+
+    Depending on the provider, this is the exact cited text or a longer retrieved chunk. It can include text from your
+    own documents, so choose whether to log it or show it to users.
+    """
+
+    kind: Literal['web'] = 'web'
+    """Source type identifier, used as a discriminator for deserialization."""
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+@dataclass(repr=False)
+class DocumentCitationSource:
+    """Any other source a citation points to, such as a document you sent or a file in the provider's file store."""
+
+    _: KW_ONLY
+
+    document_id: str | None = None
+    """The provider's ID for the file or document, if it has one. It's not a local path."""
+
+    title: str | None = None
+    """The document's title or filename, if the provider gave one."""
+
+    excerpts: list[str] = field(default_factory=list[str])
+    """Passages from the source that back the cited text.
+
+    Depending on the provider, this is the exact cited text or a longer retrieved chunk. It can include text from your
+    own documents, so choose whether to log it or show it to users.
+    """
+
+    kind: Literal['document'] = 'document'
+    """Source type identifier, used as a discriminator for deserialization."""
+
+    def __post_init__(self) -> None:
+        if not any((self.document_id, self.title, self.excerpts)):
+            raise ValueError('A document citation source must have at least one source field')
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+CitationSource: TypeAlias = Annotated[WebCitationSource | DocumentCitationSource, pydantic.Discriminator('kind')]
+"""Where a citation's information came from."""
+
+
+def _validate_citation_anchor(start: int, end: int) -> None:
+    if start < 0 or end <= start:
+        raise ValueError('Citation anchor must satisfy 0 <= start < end')
+
+
+@dataclass(repr=False, kw_only=True)
+class ContentCitationAnchor:
+    """The text the citation's sources support, as positions in the part's `content`."""
+
+    start: int
+    """The position of the first character, counting from 0."""
+
+    end: int
+    """The position after the last character, so `content[start:end]` is the range."""
+
+    kind: Literal['content'] = 'content'
+    """Anchor type identifier, used as a discriminator for deserialization."""
+
+    def __post_init__(self) -> None:
+        _validate_citation_anchor(self.start, self.end)
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+@dataclass(repr=False, kw_only=True)
+class MarkerCitationAnchor:
+    """A marker the model wrote, such as `[1]` or a link, as positions in the part's `content`."""
+
+    start: int
+    """The position of the first character, counting from 0."""
+
+    end: int
+    """The position after the last character, so `content[start:end]` is the range."""
+
+    kind: Literal['marker'] = 'marker'
+    """Anchor type identifier, used as a discriminator for deserialization."""
+
+    def __post_init__(self) -> None:
+        _validate_citation_anchor(self.start, self.end)
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+CitationAnchor: TypeAlias = Annotated[ContentCitationAnchor | MarkerCitationAnchor, pydantic.Discriminator('kind')]
+"""Which part of [`TextPart.content`][pydantic_ai.messages.TextPart.content] a citation is about."""
+
+
+@dataclass(repr=False)
+class Citation:
+    """Links part of a model's answer to the sources that back it."""
+
+    sources: list[CitationSource]
+    """Where the information came from."""
+
+    _: KW_ONLY
+
+    anchor: CitationAnchor | None = None
+    """Which part of the text the citation is about, or `None` when the provider didn't say."""
+
+    def __post_init__(self) -> None:
+        if not self.sources:
+            raise ValueError('A citation must have at least one source')
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+
+@dataclass(repr=False)
 class TextPart:
     """A plain text response from a model."""
 
@@ -3274,6 +3410,13 @@ class TextPart:
 
     This is used for data that is required to be sent back to APIs, as well as data users may want to access programmatically.
     When this field is set, `provider_name` is required to identify the provider that generated this data.
+    """
+
+    citations: list[Citation] | None = None
+    """The citations for this text, if any.
+
+    Anything else the provider returned about them, such as page numbers or confidence scores, is in
+    `provider_details['citations']`.
     """
 
     part_kind: Literal['text'] = 'text'
@@ -4931,6 +5074,7 @@ def sanitize_messages(
     messages: Sequence[ModelMessage],
     *,
     strip_system_prompts: bool = True,
+    strip_instructions: bool = True,
     strip_compaction_parts: bool = False,
     allowed_file_url_schemes: Collection[str] = ('http', 'https'),
     allowed_file_url_force_download: Collection[ForceDownloadMode] = (),
@@ -4957,6 +5101,11 @@ def sanitize_messages(
       the part, so it can't earn the system voice, whatever it says. A
       tool-less legacy [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart] is translated into
       the feedback part it always meant and takes the same rule.
+    - [`ModelRequest.instructions`][pydantic_ai.messages.ModelRequest.instructions], resetting it to
+      `None` (disable with `strip_instructions=False`). An agent run sends the agent's own
+      instructions instead, but a direct [`Model.request`][pydantic_ai.models.Model.request] call
+      without `instruction_parts` falls back to the instructions recorded in history. Every request an
+      agent run records carries them, so this doesn't warn.
     - [`FileUrl`][pydantic_ai.messages.FileUrl] parts whose URL scheme is not in
       `allowed_file_url_schemes` (default `http`/`https`). Non-HTTP schemes like `s3://` or `gs://`
       cause the model provider to fetch the object using the server-side IAM role, so they should
@@ -4965,6 +5114,11 @@ def sanitize_messages(
       `False` that aren't in `allowed_file_url_force_download`, resetting them to `False`. Both
       `True` and `'allow-local'` are reset by default. Applies to file URLs in user content and
       those nested in tool return parts.
+    - [`TextContent.metadata`][pydantic_ai.messages.TextContent.metadata] on the text items of a
+      [`UserPromptPart`][pydantic_ai.messages.UserPromptPart], resetting it to `None` and keeping the
+      text. Metadata is never sent to the model, but application code and capabilities read it to
+      recognize content they added themselves, such as a background task's report, so a client that
+      can set it could make its own text pass as theirs.
     - [`UploadedFile`][pydantic_ai.messages.UploadedFile] items unless `allow_uploaded_files=True`.
       Like a non-HTTP `FileUrl`, an `UploadedFile` references an object the model provider fetches
       using the server-side IAM role. Applies to uploaded files in user content and those nested in
@@ -4974,6 +5128,14 @@ def sanitize_messages(
       otherwise offered to a capability's `get_workspace`, so a client that can set it could point a
       reconnecting capability at an environment it attaches to using server-side provider
       credentials. Reconnect explicitly by passing an authorized `workspace=` instead.
+    - The framework-reserved `__pydantic_ai__` key from
+      [`ModelRequest.metadata`][pydantic_ai.messages.ModelRequest.metadata] and
+      [`ModelResponse.metadata`][pydantic_ai.messages.ModelResponse.metadata], keeping your own keys
+      (and resetting `metadata` to `None` if nothing else is left). Pydantic AI and its capabilities
+      keep state there that they act on in later runs, so it is only honored on trusted server-side
+      `message_history`. On client-held history that state is computed again where it's needed: a
+      file [`FileUnderstanding`][pydantic_ai.capabilities.FileUnderstanding] described is described
+      again, for example.
     - [`ToolCallPart`][pydantic_ai.messages.ToolCallPart]s at the end of the history that aren't in
       `resolved_tool_call_ids`. An unresolved tool call at the end of client-supplied history doesn't
       correspond to a paused agent run and shouldn't be executed.
@@ -5002,6 +5164,8 @@ def sanitize_messages(
             [`InstructionBaselinePart`][pydantic_ai.messages.InstructionBaselinePart]s, and demote
             `'no_output'` [`RetryFeedbackPart`][pydantic_ai.messages.RetryFeedbackPart]s to fenced
             user text. Other retry feedback is kept either way.
+        strip_instructions: Whether to reset
+            [`ModelRequest.instructions`][pydantic_ai.messages.ModelRequest.instructions] to `None`.
         strip_compaction_parts: Whether to drop
             [`CompactionPart`][pydantic_ai.messages.CompactionPart]s entirely. Off by default, for
             when the untrusted input is the entire conversation; pass `True` when the sanitized
@@ -5024,7 +5188,36 @@ def sanitize_messages(
     """
     if strip_compaction_parts:
         messages = _drop_compaction_parts(messages)
+    sanitized, _ = _sanitize_messages(
+        messages,
+        strip_system_prompts=strip_system_prompts,
+        strip_instructions=strip_instructions,
+        allowed_file_url_schemes=allowed_file_url_schemes,
+        allowed_file_url_force_download=allowed_file_url_force_download,
+        allow_uploaded_files=allow_uploaded_files,
+        strip_workspace_refs=strip_workspace_refs,
+        resolved_tool_call_ids=resolved_tool_call_ids,
+    )
+    return sanitized
 
+
+def _sanitize_messages(
+    messages: Sequence[ModelMessage],
+    *,
+    strip_system_prompts: bool,
+    strip_instructions: bool,
+    allowed_file_url_schemes: Collection[str],
+    allowed_file_url_force_download: Collection[ForceDownloadMode],
+    allow_uploaded_files: bool,
+    strip_workspace_refs: bool,
+    resolved_tool_call_ids: Collection[str],
+) -> tuple[list[ModelMessage], list[int]]:
+    """Sanitize like [`sanitize_messages`][pydantic_ai.messages.sanitize_messages], without dropping compaction parts.
+
+    Also returns, for each sanitized message, the index in `messages` it came from, so a UI adapter can carry
+    state it wrote into the reserved namespace itself past the sanitization. Warnings point at the caller of
+    the public function that called this one.
+    """
     allowed_schemes = {scheme.lower() for scheme in allowed_file_url_schemes}
     allowed_force_download = set(allowed_file_url_force_download)
     resolved_ids = set(resolved_tool_call_ids)
@@ -5033,10 +5226,13 @@ def sanitize_messages(
     disallowed_url_schemes: set[str] = set()
     reset_force_download_values: set[ForceDownloadMode] = set()
     dropped_uploaded_file_providers: set[str] = set()
+    stripped_text_metadata: list[TextContent] = []
+    reserved_metadata_messages: list[ModelMessage] = []
     dangling_tool_call_names: list[str] = []
 
     sanitized: list[ModelMessage] = []
-    for message in messages:
+    sources: list[int] = []
+    for index, message in enumerate(messages):
         if isinstance(message, ModelRequest):
             new_request_parts, request_stripped_system_prompt = _sanitize_request_parts(
                 message.parts,
@@ -5047,10 +5243,18 @@ def sanitize_messages(
                 disallowed_schemes=disallowed_url_schemes,
                 reset_force_download_values=reset_force_download_values,
                 dropped_uploaded_file_providers=dropped_uploaded_file_providers,
+                stripped_text_metadata=stripped_text_metadata,
             )
             stripped_system_prompt = stripped_system_prompt or request_stripped_system_prompt
             if new_request_parts:
-                sanitized.append(replace(message, parts=new_request_parts))
+                # Reset silently: every request an agent run records carries the agent's own instructions, so
+                # a warning would fire on every turn of a normal round trip, and agent runs never send them.
+                instructions = None if strip_instructions else message.instructions
+                metadata = _without_reserved_metadata(message, reserved_metadata_messages)
+                sanitized.append(
+                    replace(message, parts=new_request_parts, instructions=instructions, metadata=metadata)
+                )
+                sources.append(index)
             # Otherwise drop the request entirely so we don't leave an empty
             # `ModelRequest(parts=[])` in history.
         elif isinstance(message, ModelResponse):
@@ -5067,7 +5271,11 @@ def sanitize_messages(
                 # Drop `workspace_ref`: a client that can set it could point a reconnecting
                 # capability at an environment it attaches to with server-side credentials.
                 workspace_ref = None if strip_workspace_refs else message.workspace_ref
-                sanitized.append(replace(message, parts=new_response_parts, workspace_ref=workspace_ref))
+                metadata = _without_reserved_metadata(message, reserved_metadata_messages)
+                sanitized.append(
+                    replace(message, parts=new_response_parts, workspace_ref=workspace_ref, metadata=metadata)
+                )
+                sources.append(index)
             # Otherwise drop the response entirely so we don't leave an empty
             # `ModelResponse(parts=[])` in history.
         else:
@@ -5076,6 +5284,8 @@ def sanitize_messages(
     # This must stay the last step that drops or merges messages, here and in every caller: it can only
     # check the end of the history once that end is final. See `_strip_dangling_tail_tool_calls`.
     _strip_dangling_tail_tool_calls(sanitized, resolved_ids, dangling_tool_call_names)
+    # Stripping only drops or rewrites messages at the end, so the remaining sources still line up.
+    del sources[len(sanitized) :]
 
     if stripped_system_prompt:
         warnings.warn(
@@ -5084,7 +5294,7 @@ def sanitize_messages(
             'them back. Pass `strip_system_prompts=False` only when the client is trusted to own the '
             "system prompt, or set `manage_system_prompt='client'` on a UI adapter.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
 
     if disallowed_url_schemes:
@@ -5096,7 +5306,7 @@ def sanitize_messages(
             f'so they should only be accepted from trusted clients. To allow a scheme, add it to '
             f'`allowed_file_url_schemes`.',
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
 
     if reset_force_download_values:
@@ -5110,7 +5320,7 @@ def sanitize_messages(
             f'clients. To allow a value, add it to `allowed_file_url_force_download`, or set '
             f'it only on trusted server-side `message_history` passed directly to `Agent.run`.',
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
 
     if dropped_uploaded_file_providers:
@@ -5122,7 +5332,27 @@ def sanitize_messages(
             f'from the client, set `allow_uploaded_files=True`, or pass them on trusted server-side '
             f'`message_history` directly to `Agent.run`.',
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
+        )
+
+    if reserved_metadata_messages:
+        warnings.warn(
+            f'Framework-reserved `__pydantic_ai__` metadata was dropped from {len(reserved_metadata_messages)} '
+            f'client-submitted message(s). Pydantic AI and its capabilities keep state there that they act on, '
+            f'so it is not accepted from untrusted clients. Your own metadata keys are kept. Pass history that '
+            f'should keep this state as trusted server-side `message_history` instead.',
+            UserWarning,
+            stacklevel=3,
+        )
+
+    if stripped_text_metadata:
+        warnings.warn(
+            f'`TextContent.metadata` was dropped from {len(stripped_text_metadata)} client-submitted user prompt '
+            f'item(s). Metadata is never sent to the model, but application code and capabilities read it to '
+            f'recognize content they added themselves, so it is not accepted from untrusted clients. Pass '
+            f'history that carries your own metadata as trusted server-side `message_history` instead.',
+            UserWarning,
+            stacklevel=3,
         )
 
     if dangling_tool_call_names:
@@ -5134,10 +5364,22 @@ def sanitize_messages(
             f'human-in-the-loop resumption, pass matching tool call IDs to `resolved_tool_call_ids`, '
             f'or pass matching `deferred_tool_results` to a UI adapter run method.',
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
 
-    return sanitized
+    return sanitized, sources
+
+
+def _without_reserved_metadata(message: ModelMessage, stripped: list[ModelMessage]) -> dict[str, Any] | None:
+    """Return the metadata of an untrusted message without the reserved `__pydantic_ai__` key.
+
+    `stripped` is updated in place with the messages whose reserved key was dropped.
+    """
+    metadata = message.metadata
+    if metadata is None or _PYDANTIC_AI_METADATA_KEY not in metadata:
+        return metadata
+    stripped.append(message)
+    return {key: value for key, value in metadata.items() if key != _PYDANTIC_AI_METADATA_KEY} or None
 
 
 def _strip_dangling_tail_tool_calls(
@@ -5210,12 +5452,14 @@ def _sanitize_request_parts(
     disallowed_schemes: set[str],
     reset_force_download_values: set[ForceDownloadMode],
     dropped_uploaded_file_providers: set[str],
+    stripped_text_metadata: list[TextContent],
 ) -> tuple[list[ModelRequestPart], bool]:
     """Sanitize the parts of an untrusted [`ModelRequest`][pydantic_ai.messages.ModelRequest].
 
     `disallowed_schemes`, `reset_force_download_values`, and `dropped_uploaded_file_providers` are
     updated in place with any non-allowlisted file URL schemes, `force_download` values, and dropped
-    uploaded file providers encountered.
+    uploaded file providers encountered, and `stripped_text_metadata` with the user prompt
+    [`TextContent`][pydantic_ai.messages.TextContent] items whose metadata was dropped.
     Returns the kept parts and whether any part carrying the system voice
     ([`SystemPromptPart`][pydantic_ai.messages.SystemPromptPart] or an instruction part) was
     stripped. Retry feedback is kept, in a form that can't carry client-written system text; see
@@ -5239,7 +5483,7 @@ def _sanitize_request_parts(
                 reset_force_download_values,
                 dropped_uploaded_file_providers,
             )
-            new_parts.append(replace(part, content=filtered_content))
+            new_parts.append(replace(part, content=_without_text_metadata(filtered_content, stripped_text_metadata)))
         elif isinstance(part, ToolReturnPart):
             new_parts.append(
                 _sanitize_tool_return_part(
@@ -5290,6 +5534,20 @@ def _filter_user_content(
             continue
         filtered.append(item)
     return filtered
+
+
+def _without_text_metadata(content: list[UserContent], stripped: list[TextContent]) -> list[UserContent]:
+    """Drop the metadata of untrusted user prompt [`TextContent`][pydantic_ai.messages.TextContent], keeping its text.
+
+    `stripped` is updated in place with the original items whose metadata was dropped.
+    """
+    kept: list[UserContent] = []
+    for item in content:
+        if isinstance(item, TextContent) and item.metadata is not None:
+            stripped.append(item)
+            item = replace(item, metadata=None)
+        kept.append(item)
+    return kept
 
 
 def _sanitize_file_url(
@@ -5464,7 +5722,7 @@ def _sanitize_response_parts(
 
 @dataclass(repr=False)
 class TextPartDelta:
-    """A partial update (delta) for a `TextPart` to append new text content."""
+    """A partial update (delta) for a `TextPart` that appends text, citations, or both."""
 
     content_delta: str
     """The incremental text content to add to the existing `TextPart` content."""
@@ -5485,6 +5743,14 @@ class TextPartDelta:
     When this field is set, `provider_name` is required to identify the provider that generated this data.
     """
 
+    citations_delta: list[Citation] | None = None
+    """All of the part's citations, replacing any it has.
+
+    They come in one delta, without text, once the part's text is complete, and the delta also sets
+    `provider_details['citations']`. Providers that return citations at the end of the response, such as Google, send
+    it then, which can be after the part's [`PartEndEvent`][pydantic_ai.messages.PartEndEvent].
+    """
+
     part_delta_kind: Literal['text'] = 'text'
     """Part delta type identifier, used as a discriminator."""
 
@@ -5502,11 +5768,13 @@ class TextPartDelta:
         """
         if not isinstance(part, TextPart):
             raise ValueError('Cannot apply TextPartDeltas to non-TextParts')  # pragma: no cover
+        citations = part.citations if self.citations_delta is None else self.citations_delta
         return replace(
             part,
             content=part.content + self.content_delta,
             provider_name=self.provider_name or part.provider_name,
             provider_details={**(part.provider_details or {}), **(self.provider_details or {})} or None,
+            citations=citations,
         )
 
     __repr__ = _utils.dataclasses_no_defaults_repr
@@ -6196,8 +6464,10 @@ class RealtimeTurnCompleteEvent:
 
     It is synthesized by the session when a response ends and the model owes nothing more: no reply to an
     input sent (text, a tool's result, a request for a response), no answer to a tool call, and no response
-    still under way. Input transcription can finish after this event. On WebRTC sidebands, provider playback
-    can also continue until [`RealtimeOutputSpeechEndEvent`][pydantic_ai.realtime.RealtimeOutputSpeechEndEvent].
+    still under way. It also ends an exchange a failure ended (a tool raised and its failure didn't go out to the
+    model, or a tool's result would pass a usage limit), once. Input transcription can finish after this event.
+    On WebRTC sidebands, provider playback can also continue until
+    [`RealtimeOutputSpeechEndEvent`][pydantic_ai.realtime.RealtimeOutputSpeechEndEvent].
     """
 
     _: KW_ONLY

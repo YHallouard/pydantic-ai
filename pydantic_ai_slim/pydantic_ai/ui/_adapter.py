@@ -27,6 +27,7 @@ from pydantic_ai._warnings import PydanticAIDeprecationWarning
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.agent.abstract import AgentMetadata
 from pydantic_ai.capabilities import AbstractCapability, ReinjectSystemPrompt
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     CompactionPart,
     ForceDownloadMode,
@@ -40,7 +41,7 @@ from pydantic_ai.messages import (
     ToolAvailabilityDeltaPart,
     ToolRetryCause,
     _drop_compaction_parts,  # pyright: ignore[reportPrivateUsage]
-    sanitize_messages,
+    _sanitize_messages,  # pyright: ignore[reportPrivateUsage]
 )
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.output import OutputDataT, OutputSpec
@@ -51,6 +52,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_ai.workspaces import WorkspaceBackend, WorkspaceRef
 
 from ._event_stream import NativeEvent, OnCancelFunc, OnCompleteFunc, UIEventStream
+from ._utils import get_ui_message_id, set_ui_message_id, without_ui_message_id
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -393,10 +395,10 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
     """The `Accept` header value of the request, used to determine how to encode the protocol-specific events for the streaming response."""
 
     manage_system_prompt: Literal['server', 'client'] = 'server'
-    """Who owns the system prompt.
+    """Who owns the system prompt and request-level instructions in client-submitted messages.
 
-    Only affects `system_prompt` — [`instructions`][pydantic_ai.agent.Agent.instructions]
-    are always injected by the agent on every request regardless of this setting.
+    The agent's own [`instructions`][pydantic_ai.agent.Agent.instructions] are always
+    injected on every request regardless of this setting.
 
     `'server'` (default): the agent's configured `system_prompt` is authoritative.
     Any `SystemPromptPart` sent by the frontend is stripped with a warning (since a
@@ -404,11 +406,14 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
     requests), and the agent's own system prompt is reinjected at the head of the
     first request via the
     [`ReinjectSystemPrompt`][pydantic_ai.capabilities.ReinjectSystemPrompt] capability.
+    Request-level [`instructions`][pydantic_ai.messages.ModelRequest.instructions] on
+    frontend messages are reset to `None` as well.
 
     `'client'`: the frontend owns the system prompt. Frontend `SystemPromptPart`s
-    are preserved as-is, and the agent's configured `system_prompt` is not injected
-    — the caller is fully responsible for sending it on every turn if desired. To
-    opt into the same fallback-to-configured behavior as server mode, add the
+    and request-level `instructions` are preserved as-is, and the agent's configured
+    `system_prompt` is not injected — the caller is fully responsible for sending it
+    on every turn if desired. To opt into the same fallback-to-configured behavior as
+    server mode, add the
     [`ReinjectSystemPrompt`][pydantic_ai.capabilities.ReinjectSystemPrompt] capability
     to your agent.
     """
@@ -586,7 +591,14 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
 
     @cached_property
     def deferred_tool_results(self) -> DeferredToolResults | None:
-        """Deferred tool results extracted from the request, used for tool approval workflows."""
+        """Deferred tool results extracted from the request, used for tool approval workflows.
+
+        An implementation may raise `UserError` to reject a malformed request: it is resolved inside
+        the stream returned by [`run_stream_native`][pydantic_ai.ui.UIAdapter.run_stream_native]
+        rather than when it is called, so the error reaches the client as a protocol error event
+        instead of escaping the streaming response. Any other exception escapes as it normally
+        would, so a bug in an implementation still surfaces as a server error.
+        """
         return None
 
     @cached_property
@@ -619,7 +631,8 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
         [`sanitize_messages`][pydantic_ai.messages.sanitize_messages] — see its
         docstring for the full list of what's stripped — with these adapter-specific settings:
 
-        - [`SystemPromptPart`][pydantic_ai.messages.SystemPromptPart]s are stripped only when
+        - [`SystemPromptPart`][pydantic_ai.messages.SystemPromptPart]s and request-level
+          [`instructions`][pydantic_ai.messages.ModelRequest.instructions] are stripped only when
           [`manage_system_prompt`][pydantic_ai.ui.UIAdapter.manage_system_prompt] is `'server'`,
           and the agent's configured `system_prompt` is reinjected by
           [`ReinjectSystemPrompt`][pydantic_ai.capabilities.ReinjectSystemPrompt] on the next model
@@ -633,21 +646,32 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
           unless [`strip_workspace_refs`][pydantic_ai.ui.UIAdapter.strip_workspace_refs] is `False`.
         - Tool calls at the end of the history are kept when they correspond to a resolution in
           `deferred_tool_results`, so human-in-the-loop resumption continues to work.
+        - The UI message id that [`load_messages`][pydantic_ai.ui.UIAdapter.load_messages] keeps on each
+          message survives, so [`dump_messages`][pydantic_ai.ui.UIAdapter.dump_messages] can still give it
+          back. It's the client's own id, and the adapters read nothing else from that reserved namespace.
         """
         resolved_tool_call_ids: set[str] = set()
         if deferred_tool_results is not None:
             resolved_tool_call_ids.update(deferred_tool_results.approvals)
             resolved_tool_call_ids.update(deferred_tool_results.calls)
 
-        return sanitize_messages(
-            messages,
+        # The reserved namespace is dropped from client messages, but the UI message id in it is the one
+        # `load_messages` wrote itself, so it's set aside here and put back on whatever message survives.
+        ui_message_ids = [get_ui_message_id(message) for message in messages]
+        sanitized, sources = _sanitize_messages(
+            [without_ui_message_id(message) for message in messages],
             strip_system_prompts=self.manage_system_prompt == 'server',
+            strip_instructions=self.manage_system_prompt == 'server',
             allowed_file_url_schemes=self.allowed_file_url_schemes,
             allowed_file_url_force_download=self.allowed_file_url_force_download,
             allow_uploaded_files=self.allow_uploaded_files,
             strip_workspace_refs=self.strip_workspace_refs,
             resolved_tool_call_ids=resolved_tool_call_ids,
         )
+        for message, source in zip(sanitized, sources):
+            if (ui_message_id := ui_message_ids[source]) is not None:
+                set_ui_message_id(message, ui_message_id)
+        return sanitized
 
     def transform_stream(
         self,
@@ -706,6 +730,12 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
     ) -> AsyncIterator[NativeEvent]:
         """Run the agent with the protocol-specific run input and stream Pydantic AI events.
 
+        A `UserError` from [`deferred_tool_results`][pydantic_ai.ui.UIAdapter.deferred_tool_results]
+        is re-raised on the first iteration of the returned stream rather than at the call site, so
+        a subclass rejecting a malformed request surfaces that as a protocol error event on the
+        stream. Any other exception still raises at the call site, and nothing else about the run
+        input is deferred.
+
         Args:
             output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
                 output validators since output validators would expect an argument that matches the agent's output type.
@@ -731,10 +761,25 @@ class UIAdapter(ABC, Generic[RunInputT, MessageT, EventT, AgentDepsT, OutputData
                 Use `capabilities=[NativeTool(...)]` to add provider-side native tools per request.
             workspace: Optional [workspace](../../workspace.md) for this run: a backend or `Workspace` to use as is, a `WorkspaceRef` to continue in, or `'new'` for a fresh one instead of the one in `message_history`.
         """
-        if deferred_tool_results is None:
-            deferred_tool_results = self.deferred_tool_results
         if conversation_id is None:
             conversation_id = self.conversation_id
+
+        # A `UserError` rejecting the request is handed back as a failing stream so it reaches
+        # `transform_stream`'s error handling; the early return keeps the run setup below, like
+        # writing `deps.state`, from running for a request that never starts.
+        try:
+            if deferred_tool_results is None:
+                deferred_tool_results = self.deferred_tool_results
+        except UserError as e:
+            # Rebound because Python clears the `except ... as` name when the block exits, leaving
+            # the generator below with an unresolvable free variable.
+            error = e
+
+            async def rejected_stream() -> AsyncIterator[NativeEvent]:
+                raise error
+                yield  # pragma: no cover
+
+            return rejected_stream()
 
         frontend_messages = self.messages
         if message_history:

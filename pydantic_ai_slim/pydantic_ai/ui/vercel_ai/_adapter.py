@@ -53,6 +53,7 @@ from ...messages import (
     narrow_message_parts,
     parse_tool_kind,
     tool_return_content_ta,
+    tool_return_ta,
 )
 from ...output import OutputDataT
 from ...tools import AgentDepsT, DeferredToolResults, ToolDenied
@@ -78,9 +79,13 @@ from ._utils import (
     apply_message_metadata,
     dump_message_metadata,
     dump_provider_metadata,
+    dump_text_metadata,
+    iter_citation_source_chunks,
     iter_metadata_chunks,
     iter_tool_approval_responses,
     load_provider_metadata,
+    load_text_part,
+    merged_text_citations,
     tool_return_output,
 )
 from .request_types import (
@@ -484,15 +489,7 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                         pending_enqueued = []
 
                     if isinstance(part, TextUIPart):
-                        provider_meta = load_provider_metadata(part.provider_metadata)
-                        builder.add(
-                            TextPart(
-                                content=part.text,
-                                id=provider_meta.get('id'),
-                                provider_name=provider_meta.get('provider_name'),
-                                provider_details=provider_meta.get('provider_details'),
-                            )
-                        )
+                        builder.add(load_text_part(part.text, load_provider_metadata(part.provider_metadata)))
                     elif isinstance(part, ReasoningUIPart):
                         provider_meta = load_provider_metadata(part.provider_metadata)
                         builder.add(
@@ -685,11 +682,17 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                                 # claim in the metadata channel is what tells a retry apart from a
                                 # definitive failure; without it the return reloads as `'failed'`.
                                 retried = provider_meta.get('outcome') == 'retried'
+                                structured = provider_meta.get('content') if retried else None
                                 pending_returns.append(
                                     ToolReturnPart(
                                         tool_name=tool_name,
                                         tool_call_id=tool_call_id,
-                                        content=part.error_text,
+                                        # `error_text` is the rendered string; a retry's validation errors
+                                        # ride the metadata channel as the list they are, so the
+                                        # provider is sent the same structure after a round-trip.
+                                        content=_validate_tool_output(structured)
+                                        if isinstance(structured, list)
+                                        else part.error_text,
                                         outcome='retried' if retried else 'failed',
                                         retry=parse_tool_retry(provider_meta.get('retry')) if retried else None,
                                         tool_kind=tool_kind,
@@ -708,11 +711,8 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                     elif isinstance(part, DataUIPart):  # pragma: no cover
                         # Contains custom data that shouldn't be sent to the model
                         pass
-                    elif isinstance(part, SourceUrlUIPart):  # pragma: no cover
-                        # TODO: Once we support citations: https://github.com/pydantic/pydantic-ai/issues/3126
-                        pass
-                    elif isinstance(part, SourceDocumentUIPart):  # pragma: no cover
-                        # TODO: Once we support citations: https://github.com/pydantic/pydantic-ai/issues/3126
+                    elif isinstance(part, SourceUrlUIPart | SourceDocumentUIPart):
+                        # Sources are listed for display; citations load from the text part's provider metadata.
                         pass
                     elif isinstance(part, StepStartUIPart):
                         # Step boundaries are handled above, by flushing the held-back tool returns
@@ -843,6 +843,8 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
     ) -> list[UIMessagePart]:
         """Convert a ModelResponse into a UIMessage."""
         ui_parts: list[UIMessagePart] = []
+        # Consecutive text parts merge into one UI text part, so the text parts in each are kept by its index.
+        text_runs: dict[int, list[TextPart]] = {}
 
         # For builtin tools, returns can be in the same ModelResponse as calls
         local_builtin_returns: dict[str, NativeToolReturnPart] = {
@@ -856,13 +858,10 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                 # Combine consecutive text parts
                 if ui_parts and isinstance(ui_parts[-1], TextUIPart):
                     ui_parts[-1].text += part.content
+                    text_runs[len(ui_parts) - 1].append(part)
                 else:
-                    provider_metadata = dump_provider_metadata(
-                        id=part.id,
-                        provider_name=part.provider_name,
-                        provider_details=part.provider_details,
-                    )
-                    ui_parts.append(TextUIPart(text=part.content, state='done', provider_metadata=provider_metadata))
+                    text_runs[len(ui_parts)] = [part]
+                    ui_parts.append(TextUIPart(text=part.content, state='done'))
             elif isinstance(part, ThinkingPart):
                 provider_metadata = dump_provider_metadata(
                     id=part.id,
@@ -1004,7 +1003,7 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
             else:
                 assert_never(part)
 
-        return ui_parts
+        return _with_text_citations(ui_parts, text_runs)
 
     @staticmethod
     def _dump_tool_call_part(
@@ -1032,6 +1031,7 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
             retry=tool_retry_payload(tool_result.retry)
             if isinstance(tool_result, ToolReturnPart) and tool_result.retry is not None
             else None,
+            content=_retried_structured_content(tool_result),
         )
         tool_type = f'tool-{part.tool_name}'
         ui_parts: list[UIMessagePart] = []
@@ -1129,7 +1129,8 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
         (`ToolOutputAvailablePart` / `ToolOutputErrorPart` / `ToolOutputDeniedPart`). A retried
         result (`outcome='retried'`) shares `ToolOutputErrorPart` with a failed one — the protocol
         has no separate retry concept — so its outcome rides the `providerMetadata` channel that
-        already carries `'interrupted'`, and is restored from there on reload. A legacy
+        already carries `'interrupted'`, and is restored from there on reload, along with its
+        validation errors as the list they are, since `errorText` can only hold their rendering. A legacy
         `RetryPromptPart` is dumped as the part it always meant, so a tool-bound one takes that same
         path and reloads as a `ToolReturnPart` with `outcome='retried'`.
 
@@ -1144,6 +1145,9 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
         in the order they were authored, so it reloads as the same parts in the same order and
         re-sends the same request bytes. The request's metadata rides on the last `role='user'` one, or
         on the last one when there is none, so a frontend that drops system messages keeps it.
+
+        Consecutive `TextPart`s come back as one, with the first part's `id` and `provider_details` and all of
+        their citations, anchored in the merged text.
 
         Tool calls lose one thing too: `ToolCallPart.args` that don't parse as a JSON object are
         rewritten to `{'INVALID_JSON': '<raw args>'}` (see
@@ -1226,6 +1230,25 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                 assert_never(msg)
 
         return result
+
+
+def _with_text_citations(ui_parts: list[UIMessagePart], text_runs: dict[int, list[TextPart]]) -> list[UIMessagePart]:
+    """Set each UI text part's provider metadata, with its citations, and list its web sources after it.
+
+    Sources follow their text part as `source-url` parts, matching the event stream.
+    """
+    result: list[UIMessagePart] = []
+    source_urls: set[str] = set()
+    for index, ui_part in enumerate(ui_parts):
+        result.append(ui_part)
+        if isinstance(ui_part, TextUIPart):
+            text_parts = text_runs[index]
+            ui_part.provider_metadata = dump_text_metadata(text_parts)
+            result.extend(
+                SourceUrlUIPart(source_id=chunk.source_id, url=chunk.url, title=chunk.title)
+                for chunk in iter_citation_source_chunks(merged_text_citations(text_parts), source_urls)
+            )
+    return result
 
 
 def _convert_user_prompt_part(
@@ -1316,6 +1339,20 @@ def _denial_reason(part: ToolUIPart | DynamicToolUIPart) -> str:
     if isinstance(part.approval, ToolApprovalResponded) and part.approval.reason:
         return part.approval.reason
     return ToolDenied().message
+
+
+def _retried_structured_content(tool_result: ToolReturnPart | None) -> list[Any] | None:
+    """A retried return's list content, as JSON data for the metadata channel, or `None`.
+
+    `ToolOutputErrorPart.error_text` is a string, and rendering a retry's validation errors into it
+    loses the structure a provider without a native error channel is sent: `{"error": [...]}` would
+    become `{"error": "[...]"}` after a round-trip. Only list content rides along; a string error is
+    already exactly what `error_text` holds.
+    """
+    content: object = None if tool_result is None or tool_result.outcome != 'retried' else tool_result.content
+    if not isinstance(content, list):
+        return None
+    return tool_return_ta.dump_python(content, mode='json', by_alias=True)
 
 
 def _validate_tool_output(output: Any) -> Any:

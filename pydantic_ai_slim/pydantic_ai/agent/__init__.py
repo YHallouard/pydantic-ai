@@ -94,7 +94,7 @@ from ..capabilities import (
     ToolSearch as ToolSearchCap,
 )
 from ..capabilities._dynamic import wrap_capability_funcs
-from ..capabilities._ordering import has_capability_type
+from ..capabilities._ordering import collect_leaves, has_capability_type
 from ..capabilities._pending_messages import PendingMessageDrainCapability
 from ..capabilities.abstract import (
     _combine_duplicate_capabilities,  # pyright: ignore[reportPrivateUsage]
@@ -109,6 +109,7 @@ from ..capabilities.hooks import EventT, Hooks, OnEventHookFunc
 from ..capabilities.instrumentation import Instrumentation as InstrumentationCap
 from ..capabilities.wrapper import WrapperCapability
 from ..conversation import Conversation
+from ..models import _SettingsLayer  # pyright: ignore[reportPrivateUsage]
 from ..models.instrumented import InstrumentationSettings, InstrumentedModel
 from ..native_tools import AbstractNativeTool
 from ..native_tools._tool_search import ToolSearchTool
@@ -446,6 +447,18 @@ def _agent_instruction_source(instruction: _instructions.AgentInstruction[Any]) 
     unidentified.
     """
     return _messages.AgentInstructionSource() if isinstance(instruction, (str, _messages.InstructionPart)) else None
+
+
+def _run_instruction_source(instruction: _instructions.AgentInstruction[Any]) -> _messages.InstructionSource | None:
+    """The source to attribute one of the instructions passed to a single run to.
+
+    Only a named `InstructionPart` is addressed, as `'run:<name>'`, so the same block passed to a later
+    run of the conversation can append its changes. Anything unnamed stays unidentified: nothing says a
+    later run's unnamed text is the same block.
+    """
+    if isinstance(instruction, _messages.InstructionPart) and instruction.name is not None:
+        return _messages.RunInstructionSource()
+    return None
 
 
 def _normalize_agent_retries(retries: AgentRetries, *, default: int = 1) -> _ResolvedAgentRetries:
@@ -1759,7 +1772,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         # like later steps' do. Inside a durable workflow or flow, the durability capability supplies the
         # default ids, so a re-execution of this code gets the same ones.
         resolved_run_id = _agent_graph.resolve_run_id(
-            run_id if run_id is not None else bootstrap_capability._default_run_id(),  # pyright: ignore[reportPrivateUsage]
+            run_id if run_id is not None else bootstrap_capability.get_default_run_id(),
             message_history,
         )
         state = _agent_graph.GraphAgentState(
@@ -1771,7 +1784,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             conversation_id=_agent_graph.resolve_conversation_id(
                 conversation_id,
                 message_history,
-                default=bootstrap_capability._default_conversation_id(resolved_run_id),  # pyright: ignore[reportPrivateUsage]
+                default=bootstrap_capability.get_default_conversation_id(resolved_run_id),
             ),
         )
 
@@ -1779,10 +1792,10 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         # capability supplies a replay-safe clock and start time, so a replayed or recovered run keeps
         # the deadline it started with. A run started inside another run can only shorten its deadline, and
         # without a clock of its own measures it against the clock the outer run set it with.
-        run_clock = bootstrap_capability._run_clock() or current_run_clock()  # pyright: ignore[reportPrivateUsage]
+        run_clock = bootstrap_capability.get_run_clock() or current_run_clock()
         deadline = inherited_run_deadline()
         if timeout is not None:
-            start = await bootstrap_capability._run_start_time(resolved_run_id) or run_clock()  # pyright: ignore[reportPrivateUsage]
+            start = await bootstrap_capability.get_run_start_time(resolved_run_id) or run_clock()
             own_deadline = start + timedelta(seconds=timeout)
             deadline = own_deadline if deadline is None else min(own_deadline, deadline)
         usage_limits = usage_limits or _usage.UsageLimits()
@@ -2056,6 +2069,9 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 has_resolvers=pre_run_root._has_get_workspace or run_capability._has_get_workspace,  # pyright: ignore[reportPrivateUsage]
             )
 
+        # The ids of the models this run has checked for a thinking override, so each warns once per run.
+        thinking_checked_model_ids: set[int] = set()
+
         # Build model settings resolver using per-run capability. Shared with `realtime_session` via
         # `_layer_model_settings` (agent -> capability -> run order; the model's own settings are the
         # base for a graph run). Resolved per model-request step here; once at connect in a session.
@@ -2066,6 +2082,31 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             # (Hoisted to a local first so pyright narrows cleanly after `RunContext.model` widened to
             # `AbstractModel`; member access on the narrowed attribute directly trips a false positive.)
             step_model = run_context.model
+            # Warn when a provider-specific thinking setting from a broader static layer replaces a narrower
+            # `thinking`, for each model a step uses. Callable layers are not checked, as for `tool_choice` above.
+            # Passing the model's own settings as the base keeps `Model.prepare_request` from repeating it.
+            step_model_id = id(step_model)
+            if isinstance(step_model, models.Model) and step_model_id not in thinking_checked_model_ids:
+                thinking_checked_model_ids.add(step_model_id)
+                step_model._warn_if_thinking_overridden(  # pyright: ignore[reportPrivateUsage]
+                    [
+                        _SettingsLayer("the model's `settings`", step_model.settings),
+                        _SettingsLayer(
+                            '`override(model_settings=...)`'
+                            if model_settings_override is not None
+                            else "the agent's `model_settings`",
+                            None if callable(agent_model_settings) else agent_model_settings,
+                        ),
+                        # A capability like `Thinking` sets only `thinking`, so the warning doesn't suggest setting
+                        # the provider-specific one there.
+                        _SettingsLayer(
+                            'a capability', None if callable(cap_model_settings) else cap_model_settings, settable=False
+                        ),
+                        _SettingsLayer(
+                            "the run's `model_settings`", None if callable(run_model_settings) else run_model_settings
+                        ),
+                    ]
+                )
             return _layer_model_settings(
                 run_context,
                 (agent_model_settings, cap_model_settings, run_model_settings),
@@ -3718,9 +3759,10 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             instructions.extend(cap_instructions if cap_instructions is not None else self._cap_instructions)
             if additional_instructions is not None:
                 # Instructions passed to a specific run are already the caller's to change, and
-                # aren't part of the agent's own configured instructions.
+                # aren't part of the agent's own configured instructions, so a named part is keyed
+                # beneath the run (`'run:<name>'`) rather than the agent.
                 instructions.extend(
-                    _instructions.sourced_instruction(instruction, None)
+                    _instructions.sourced_instruction(instruction, _run_instruction_source(instruction))
                     for instruction in _instructions.normalize_instructions(additional_instructions)
                 )
 
@@ -3910,6 +3952,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         and is not itself a run.
         """
         from ..realtime import RealtimeModel, infer_realtime_model
+        from ..realtime._utils import session_instructions
 
         if not isinstance(model, RealtimeModel):
             model = infer_realtime_model(model)
@@ -4013,6 +4056,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 'contribute tools or native tools are not supported; remove `defer_loading=True` '
                 f'from: {formatted_ids}.'
             )
+        _warn_realtime_uncalled_hooks(run_capability)
         # `_resolve_run_capabilities` already registered `run_context.capabilities` for the toolset/connect
         # `for_run` below, exactly as the graph run relies on. The root of that chain has to be published
         # too, or the context contradicts itself: `capabilities` populated while `root_capability` is
@@ -4190,9 +4234,22 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             # Nothing appends here, so an empty append-mode block has no withdrawal to record.
             instruction_parts = _messages.InstructionPart.sorted([part for part in instruction_parts if part.content])
             resolved_instructions = _messages.InstructionPart.join(instruction_parts)
-            request_messages = [
-                *(message_history or ()),
-                _messages.ModelRequest(parts=[], instructions=resolved_instructions or None),
+            # As in a standard run (`UserPromptNode`), the agent's system prompts open a fresh conversation,
+            # while seeded history is taken to carry its own, with its dynamic system prompts re-evaluated.
+            # The model sends this standing prompt as instructions, and the session records it.
+            seeded_history = list(message_history or ())
+            system_prompt_parts: list[_messages.SystemPromptPart] = []
+            if seeded_history:
+                await _system_prompt.reevaluate_dynamic_system_prompts(
+                    seeded_history, self._system_prompt_dynamic_functions, run_context
+                )
+            else:
+                system_prompt_parts = await _system_prompt.resolve_system_prompts(
+                    self._system_prompts, self._system_prompt_functions, run_context
+                )
+            request_messages: list[_messages.ModelMessage] = [
+                *seeded_history,
+                _messages.ModelRequest(parts=[*system_prompt_parts], instructions=resolved_instructions or None),
             ]
             model_request_parameters = models.ModelRequestParameters(
                 function_tools=tool_defs,
@@ -4269,7 +4326,10 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 model_request_parameters=model_request_parameters,
                 model_settings=effective_model_settings,
                 instructions=resolved_instructions or None,
+                session_instructions=session_instructions(request_messages, model_request_parameters) or None,
                 request_messages=request_messages,
+                message_history=seeded_history,
+                system_prompt=system_prompt_parts,
                 model_profile=model_profile,
                 instrumentation_settings=session_instrumentation_settings,
                 conversation_id=conversation_id,
@@ -4420,7 +4480,12 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     '`message_history`.'
                 )
 
-            output_modality = (resolved.model_settings or {}).get('output_modality', 'audio')
+            session_settings: RealtimeModelSettings | None = resolved.model_settings
+            # A model that only writes text (a perception model, say) defaults to it, rather than to speech.
+            supports_audio_output = resolved.model_profile.get('supports_audio_output', True)
+            if not supports_audio_output and 'output_modality' not in (session_settings or {}):
+                session_settings = {**(session_settings or {}), 'output_modality': 'text'}
+            output_modality = (session_settings or {}).get('output_modality', 'audio')
             # Unlike a setting the provider merely ignores, this one changes what the caller gets back:
             # a model that can't do it either fails the handshake (Gemini) or answers with speech anyway
             # (xAI), so it is rejected here rather than after a connection is open.
@@ -4430,18 +4495,23 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     'it only generates audio. Read the spoken answer from the transcript on the '
                     '`SpeechPart` instead.'
                 )
+            if output_modality == 'audio' and not supports_audio_output:
+                raise exceptions.UserError(
+                    f"The {resolved.model.model_name!r} realtime model does not support `output_modality='audio'`; "
+                    "it only generates text. Leave `output_modality` unset, or set it to `'text'`."
+                )
 
             connection_manager = (
                 resolved.model.connect(
                     messages=resolved.request_messages,
-                    model_settings=resolved.model_settings,
+                    model_settings=session_settings,
                     model_request_parameters=resolved.model_request_parameters,
                 )
                 if provider_session is None
                 else resolved.model.connect_webrtc(
                     provider_session,
                     messages=resolved.request_messages,
-                    model_settings=resolved.model_settings,
+                    model_settings=session_settings,
                     model_request_parameters=resolved.model_request_parameters,
                 )
             )
@@ -4464,7 +4534,10 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     retain_images_every_n=retain_images_every_n,
                     retain_images_max=retain_images_max,
                     retain_audio_max_seconds=retain_audio_max_seconds,
-                    message_history=message_history,
+                    message_history=resolved.message_history,
+                    _opening_request=(
+                        _messages.ModelRequest(parts=[*resolved.system_prompt]) if resolved.system_prompt else None
+                    ),
                     conversation_id=resolved.conversation_id,
                     run_id=resolved.run_id,
                     instructions=resolved.instructions,
@@ -4478,7 +4551,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     # Surfaced on the session span so the session's configured native tools and realtime
                     # settings are inspectable, respecting `include_model_request_parameters`.
                     model_request_parameters=resolved.model_request_parameters,
-                    model_settings=resolved.model_settings,
+                    model_settings=session_settings,
                     wrap_event_stream=resolved.wrap_event_stream,
                 )
                 lifecycle.session = session
@@ -4795,6 +4868,7 @@ class _PreparedAgentRun(Generic[_PreparedDepsT, _PreparedOutputT]):
         async with AsyncExitStack() as stack:
             # Enter first so cancellation is classified only after every other context has torn down.
             await stack.enter_async_context(_translate_cancellation())
+            stack.callback(lambda: graph_deps.tool_manager._release_context())  # pyright: ignore[reportPrivateUsage]
             stack.callback(refresh_workspace_ref)
             # This run's usage is credited to no span until one of its own is opened (by
             # `Instrumentation.wrap_run`), so an uninstrumented run started from inside an
@@ -4965,6 +5039,33 @@ _AUTO_INJECT_CAPABILITY_TYPES: tuple[type[AbstractCapability[Any]], ...] = (
 """Infrastructure capabilities auto-injected when not already present."""
 
 
+def _warn_realtime_uncalled_hooks(run_capability: AbstractCapability[Any]) -> None:
+    """Warn once about each capability in a realtime session's tree that implements a hook the session never calls."""
+    found: dict[int, tuple[AbstractCapability[Any], tuple[str, ...]]] = {}
+
+    def visit(capability: AbstractCapability[Any]) -> None:
+        if id(capability) in found:
+            return
+        found[id(capability)] = (capability, capability._realtime_uncalled_hooks())  # pyright: ignore[reportPrivateUsage]
+        if isinstance(capability, WrapperCapability):
+            # `apply` visits a wrapper over a single leaf in that leaf's place, so ask the leaf too.
+            wrapped_leaves = collect_leaves(capability.wrapped)
+            if len(wrapped_leaves) == 1 and wrapped_leaves[0] is capability.wrapped:
+                visit(capability.wrapped)
+
+    run_capability.apply(visit)
+    for capability, hooks in found.values():
+        if hooks:
+            name = f'`{type(capability).__name__}`' + (f' (id={capability.id!r})' if capability.id else '')
+            warnings.warn(
+                f'Capability {name} implements {", ".join(f"`{hook}`" for hook in hooks)}, which realtime '
+                'sessions never call, so it may not work as intended in this session. See '
+                'https://pydantic.dev/docs/ai/realtime/capabilities/ for the hooks a session runs.',
+                UserWarning,
+                stacklevel=2,
+            )
+
+
 def _run_instrumentation_settings(
     capabilities: Sequence[AbstractCapability[Any]], *, default: InstrumentationSettings | None = None
 ) -> InstrumentationSettings | None:
@@ -5121,7 +5222,7 @@ def _validate_capability_ids(capabilities: Sequence[AbstractCapability[Any]]) ->
     assembly, which also covers capabilities supplied per-run or returned by `for_run` and so can't
     be checked at construction.
     """
-    owners: dict[str, type[AbstractCapability[Any]]] = {}
+    owners: dict[str, AbstractCapability[Any]] = {}
     for cap in capabilities:
         if cap.defer_loading is True and cap._has_get_workspace:  # pyright: ignore[reportPrivateUsage]
             raise exceptions.UserError(
@@ -5141,10 +5242,10 @@ def _validate_capability_ids(capabilities: Sequence[AbstractCapability[Any]]) ->
         # one order through and reject the other.
         owner = owners.get(cap.id)
         if owner is not None:
-            _reject_class_crossing_id(cap.id, {owner, type(cap)})
+            _reject_class_crossing_id(cap.id, {type(owner), type(cap)})
             if not _declares_default_id(type(cap)):
-                raise exceptions.UserError(_repeated_id_message(cap.id))
-        owners.setdefault(cap.id, type(cap))
+                raise exceptions.UserError(_repeated_id_message(cap.id, [owner, cap]))
+        owners.setdefault(cap.id, cap)
     return set(owners)
 
 
